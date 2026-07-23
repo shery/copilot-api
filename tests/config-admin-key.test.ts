@@ -62,6 +62,53 @@ afterEach(() => {
 })
 
 describe("config admin api key", () => {
+  test("generates and persists a regular api key when missing", () => {
+    const tempDir = createTempConfigDir()
+    const configPath = writeConfigFile(tempDir, {})
+
+    runConfigScript(
+      tempDir,
+      'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
+    )
+
+    const config = readConfigFile(configPath)
+    expect(config.auth?.apiKeys).toHaveLength(1)
+    expect(config.auth?.apiKeys?.[0]).toHaveLength(64)
+  })
+
+  test("keeps a generated regular api key stable across startup merges", () => {
+    const tempDir = createTempConfigDir()
+    const configPath = writeConfigFile(tempDir, { auth: { apiKeys: [] } })
+
+    runConfigScript(
+      tempDir,
+      'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
+    )
+    const generatedApiKey = readConfigFile(configPath).auth?.apiKeys?.[0]
+
+    runConfigScript(
+      tempDir,
+      'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
+    )
+
+    expect(readConfigFile(configPath).auth?.apiKeys?.[0]).toBe(generatedApiKey)
+  })
+
+  test("restricts config file permissions when writing", () => {
+    if (process.platform === "win32") return
+
+    const tempDir = createTempConfigDir()
+    const configPath = writeConfigFile(tempDir, {})
+    fs.chmodSync(configPath, 0o644)
+
+    runConfigScript(
+      tempDir,
+      'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
+    )
+
+    expect(fs.statSync(configPath).mode & 0o777).toBe(0o600)
+  })
+
   test("generates and persists an admin api key when missing", () => {
     const tempDir = createTempConfigDir()
     const configPath = writeConfigFile(tempDir, {

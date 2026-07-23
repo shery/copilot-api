@@ -214,6 +214,43 @@ function generateAdminApiKey(): string {
   return randomBytes(32).toString("hex")
 }
 
+function ensureApiKeys(config: AppConfig): {
+  mergedConfig: AppConfig
+  changed: boolean
+} {
+  const apiKeys = config.auth?.apiKeys
+    ?.filter((key): key is string => typeof key === "string")
+    .map((key) => key.trim())
+    .filter(Boolean)
+
+  if (apiKeys && apiKeys.length > 0) {
+    const normalizedApiKeys = [...new Set(apiKeys)]
+    const changed =
+      JSON.stringify(config.auth?.apiKeys) !== JSON.stringify(normalizedApiKeys)
+    return {
+      mergedConfig:
+        changed ?
+          {
+            ...config,
+            auth: { ...config.auth, apiKeys: normalizedApiKeys },
+          }
+        : config,
+      changed,
+    }
+  }
+
+  return {
+    mergedConfig: {
+      ...config,
+      auth: {
+        ...config.auth,
+        apiKeys: [randomBytes(32).toString("hex")],
+      },
+    },
+    changed: true,
+  }
+}
+
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error
 }
@@ -275,11 +312,15 @@ function readEditableConfigFromDisk(): AppConfig {
 
 function writeConfigToDisk(config: AppConfig): void {
   fs.mkdirSync(PATHS.APP_DIR, { recursive: true })
-  fs.writeFileSync(
-    PATHS.CONFIG_PATH,
-    `${JSON.stringify(config, null, 2)}\n`,
-    "utf8",
-  )
+  fs.writeFileSync(PATHS.CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  try {
+    fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
+  } catch {
+    return
+  }
 }
 
 function mergeDefaultConfig(config: AppConfig): {
@@ -391,26 +432,28 @@ function ensureAdminApiKey(config: AppConfig): {
     }
   }
 
-  const editableConfig = readEditableConfigFromDisk()
-  const { mergedConfig } = mergeDefaultConfig({
-    ...editableConfig,
-    auth: {
-      ...editableConfig.auth,
-      adminApiKey: generateAdminApiKey(),
+  return {
+    mergedConfig: {
+      ...config,
+      auth: {
+        ...config.auth,
+        adminApiKey: generateAdminApiKey(),
+      },
     },
-  })
-
-  return { mergedConfig, changed: true }
+    changed: true,
+  }
 }
 
 export function mergeConfigWithDefaults(): AppConfig {
   const config = readConfigFromDisk()
   const { mergedConfig, changed } = mergeDefaultConfig(config)
+  const { mergedConfig: mergedConfigWithApiKeys, changed: apiKeysChanged } =
+    ensureApiKeys(mergedConfig)
   const {
     mergedConfig: mergedConfigWithAdminApiKey,
     changed: adminApiKeyChanged,
-  } = ensureAdminApiKey(mergedConfig)
-  const shouldPersistConfig = changed || adminApiKeyChanged
+  } = ensureAdminApiKey(mergedConfigWithApiKeys)
+  const shouldPersistConfig = changed || apiKeysChanged || adminApiKeyChanged
 
   if (shouldPersistConfig) {
     try {

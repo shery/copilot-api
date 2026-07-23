@@ -1,0 +1,194 @@
+# Copilot API CLI 使用指南
+
+本指南面向通过命令行在本机运行 Copilot API 的用户。CLI 默认只监听 `127.0.0.1`，并在首次启动时自动生成 API Key。
+
+## 1. 选择运行方式
+
+使用已发布版本：
+
+```sh
+npx @jeffreycao/copilot-api@latest --help
+```
+
+如果已安装 Bun，推荐用 Bun 运行，以启用完整的 token usage 存储：
+
+```sh
+bunx --bun @jeffreycao/copilot-api@latest --help
+```
+
+从源码运行：
+
+```sh
+bun install --frozen-lockfile
+bun run start --help
+```
+
+下文使用 `npx @jeffreycao/copilot-api@latest`。从源码运行时，将其替换为 `bun run start`。
+
+## 2. 登录 Provider
+
+使用 GitHub Copilot：
+
+```sh
+npx @jeffreycao/copilot-api@latest auth login --provider copilot
+```
+
+按照终端提示在浏览器中完成 GitHub Device Flow。需要有效的 GitHub Copilot 订阅。
+
+也可以配置其他 Provider：
+
+```sh
+npx @jeffreycao/copilot-api@latest auth login --provider codex
+npx @jeffreycao/copilot-api@latest auth login --provider dashscope
+npx @jeffreycao/copilot-api@latest auth login --provider deepseek
+npx @jeffreycao/copilot-api@latest auth login --provider openrouter
+npx @jeffreycao/copilot-api@latest auth login --provider custom
+```
+
+## 3. 启动本地服务
+
+```sh
+npx @jeffreycao/copilot-api@latest start
+```
+
+默认地址：
+
+```text
+http://localhost:4141
+```
+
+首次启动会在 `config.json` 中生成两种不同的 Key：
+
+- `auth.apiKeys[0]`：供 OpenAI、Anthropic、Claude Code 等普通客户端使用。
+- `auth.adminApiKey`：仅用于 `/admin/*`，不要配置给普通客户端。
+
+配置路径：
+
+| 系统 | 路径 |
+| --- | --- |
+| Linux/macOS | `~/.local/share/copilot-api/config.json` |
+| Windows | `%USERPROFILE%\.local\share\copilot-api\config.json` |
+
+查看实际路径和认证状态：
+
+```sh
+npx @jeffreycao/copilot-api@latest debug
+```
+
+## 4. 验证服务
+
+根路径是无需认证的健康检查：
+
+```sh
+curl http://localhost:4141/
+```
+
+其他接口需要 `auth.apiKeys` 中的普通 Key：
+
+```sh
+curl http://localhost:4141/v1/models \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+也可以使用：
+
+```http
+x-api-key: YOUR_API_KEY
+```
+
+## 5. 配置客户端
+
+### OpenAI 兼容客户端
+
+```text
+Base URL: http://localhost:4141/v1
+API Key:  config.json 中的 auth.apiKeys[0]
+```
+
+### Anthropic SDK
+
+```sh
+export ANTHROPIC_BASE_URL=http://localhost:4141
+export ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY
+```
+
+### Claude Code
+
+```sh
+npx @jeffreycao/copilot-api@latest start --claude-code
+```
+
+该命令会根据可用模型生成 Claude Code 环境变量命令，并复制到剪贴板。剪贴板内容包含本地 API Key，不要粘贴到聊天、Issue 或日志中。
+
+## 6. 常用启动选项
+
+```sh
+# 修改端口
+npx @jeffreycao/copilot-api@latest start --port 8080
+
+# 使用代理环境变量
+npx @jeffreycao/copilot-api@latest start --proxy-env
+
+# 显式指定数据目录
+npx @jeffreycao/copilot-api@latest --api-home=/safe/path start
+```
+
+安全默认：
+
+- 不使用 `--show-token`。
+- 处理敏感代码时不使用 `--verbose`，因为详细日志会记录请求和响应。
+- 不通过 `--github-token` 传入长期 Token；优先使用 `auth login` 后保存的受保护凭据文件。
+
+## 7. 远程访问
+
+默认的 `127.0.0.1` 仅允许本机访问。只有明确需要局域网或反向代理访问时才运行：
+
+```sh
+npx @jeffreycao/copilot-api@latest start --host 0.0.0.0
+```
+
+开放监听前必须：
+
+1. 保留非空且随机的 `auth.apiKeys`。
+2. 使用防火墙限制来源地址。
+3. 公网访问放在 HTTPS 反向代理后。
+4. 不暴露 `config.json`、凭据目录和日志目录。
+
+Docker 仅本机映射：
+
+```sh
+docker run \
+  -p 127.0.0.1:4141:4141 \
+  -v "$(pwd)/copilot-data:/root/.local/share/copilot-api" \
+  copilot-api
+```
+
+镜像 entrypoint 会让容器内服务监听所有接口；宿主机仍通过 `127.0.0.1:4141:4141` 限制访问。
+
+## 8. 用量与诊断
+
+CLI 不提供浏览器 Usage Viewer。可使用桌面应用，或直接调用受保护接口：
+
+```sh
+curl http://localhost:4141/usage \
+  -H "x-api-key: YOUR_API_KEY"
+
+curl "http://localhost:4141/token-usage?period=week" \
+  -H "x-api-key: YOUR_API_KEY"
+```
+
+诊断环境和路径：
+
+```sh
+npx @jeffreycao/copilot-api@latest debug --json
+```
+
+## 9. 更新
+
+使用 `@latest` 的 `npx`/`bunx` 命令会解析最新发布版本。源码运行时：
+
+```sh
+git pull
+bun install --frozen-lockfile
+bun run build
+```

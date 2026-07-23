@@ -25,6 +25,7 @@ import {
 } from "./lib/utils"
 
 interface RunServerOptions {
+  host: string
   port: number
   verbose: boolean
   githubToken?: string
@@ -38,6 +39,7 @@ async function setupCopilotMode(
   fromCli: boolean,
   serverUrl: string,
   claudeCode: boolean,
+  apiKey: string,
 ): Promise<void> {
   state.githubToken = githubToken
   consola.info(
@@ -61,11 +63,11 @@ async function setupCopilotMode(
   )
 
   if (claudeCode) {
-    runClaudeCode(serverUrl)
+    runClaudeCode(serverUrl, apiKey)
   }
 }
 
-function runClaudeCode(serverUrl: string): void {
+function runClaudeCode(serverUrl: string, apiKey: string): void {
   consola.log(
     "\n💡 Tip: The --claude-code flag simply generates a clipboard command for launching Claude Code. \n"
       + "All models remain fully accessible without this flag, just configure the model ID directly in your settings.json file.",
@@ -89,7 +91,7 @@ function runClaudeCode(serverUrl: string): void {
   const command = generateEnvScript(
     {
       ANTHROPIC_BASE_URL: serverUrl,
-      ANTHROPIC_AUTH_TOKEN: "dummy",
+      ANTHROPIC_AUTH_TOKEN: apiKey,
       ANTHROPIC_MODEL: sonnetModel ?? opusModel,
       ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
       ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
@@ -120,6 +122,7 @@ function runClaudeCode(serverUrl: string): void {
 async function setupProviderMode(
   serverUrl: string,
   claudeCode: boolean,
+  apiKey: string,
 ): Promise<void> {
   const enabledProviders = listEnabledProviders()
 
@@ -132,7 +135,13 @@ async function setupProviderMode(
   await runProviderSetup()
 
   if (state.githubToken) {
-    await setupCopilotMode(state.githubToken, false, serverUrl, claudeCode)
+    await setupCopilotMode(
+      state.githubToken,
+      false,
+      serverUrl,
+      claudeCode,
+      apiKey,
+    )
     return
   }
 
@@ -151,7 +160,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   consola.options.throttle = 0
 
-  mergeConfigWithDefaults()
+  const config = mergeConfigWithDefaults()
+  const apiKey = config.auth?.apiKeys?.[0]
+  invariant(apiKey, "A local API key should be configured")
 
   await initOpencodeVersion()
 
@@ -169,7 +180,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   await ensurePaths()
 
-  const serverUrl = `http://localhost:${options.port}`
+  const displayHost = options.host === "127.0.0.1" ? "localhost" : options.host
+  const serverUrl = `http://${displayHost}:${options.port}`
 
   const githubToken = options.githubToken || (await readGitHubToken())
   if (githubToken) {
@@ -178,19 +190,20 @@ export async function runServer(options: RunServerOptions): Promise<void> {
       Boolean(options.githubToken),
       serverUrl,
       options.claudeCode,
+      apiKey,
     )
   } else {
-    await setupProviderMode(serverUrl, options.claudeCode)
+    await setupProviderMode(serverUrl, options.claudeCode, apiKey)
   }
 
-  consola.box(
-    `🌐 Usage Viewer: ${serverUrl}/usage-viewer?endpoint=${serverUrl}/usage`,
-  )
+  consola.info(`API server: ${serverUrl}`)
+  consola.info("API key is stored in the local config file")
 
   const { server } = await import("./server")
 
   serve({
     fetch: server.fetch as ServerHandler,
+    hostname: options.host,
     port: options.port,
     bun: {
       idleTimeout: 0,
@@ -204,6 +217,11 @@ export const start = defineCommand({
     description: "Start the Copilot API server",
   },
   args: {
+    host: {
+      type: "string",
+      default: "127.0.0.1",
+      description: "Host address to listen on",
+    },
     port: {
       alias: "p",
       type: "string",
@@ -242,6 +260,7 @@ export const start = defineCommand({
   },
   run({ args }) {
     return runServer({
+      host: args.host,
       port: Number.parseInt(args.port, 10),
       verbose: args.verbose,
       githubToken: args["github-token"],

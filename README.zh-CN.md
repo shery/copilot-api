@@ -44,6 +44,8 @@ AI gateway 会从同一个本地端点暴露 OpenAI / Anthropic 兼容 API，让
 
 ## 安装
 
+首次使用建议先阅读：[CLI 使用指南](./docs/CLI.zh-CN.md)。
+
 安装依赖：
 
 ```sh
@@ -116,7 +118,7 @@ docker build -t copilot-api .
 
 ```sh
 mkdir -p ./copilot-data
-docker run -p 4141:4141 -v $(pwd)/copilot-data:/root/.local/share/copilot-api copilot-api
+docker run -p 127.0.0.1:4141:4141 -v $(pwd)/copilot-data:/root/.local/share/copilot-api copilot-api
 ```
 
 这会把宿主机上的 `./copilot-data` 映射到容器内的 `/root/.local/share/copilot-api`，用于持久化 GitHub 认证数据、provider 配置和其他 gateway 状态。
@@ -124,7 +126,7 @@ docker run -p 4141:4141 -v $(pwd)/copilot-data:/root/.local/share/copilot-api co
 也可以直接通过环境变量传入 GitHub token：
 
 ```sh
-docker run -p 4141:4141 -e GH_TOKEN=your_github_token_here copilot-api
+docker run -p 127.0.0.1:4141:4141 -e GH_TOKEN=your_github_token_here copilot-api
 ```
 
 ## Electron 桌面应用
@@ -185,7 +187,7 @@ npx @jeffreycao/copilot-api@latest start --claude-code
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:4141",
-    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_AUTH_TOKEN": "<config.json 中的 auth.apiKeys[0]>",
     "ANTHROPIC_MODEL": "gpt-5.6-sol[1m]",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-sol[1m]",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-luna[1m]",
@@ -250,7 +252,7 @@ npx @jeffreycao/copilot-api@latest start
       "name": "My Local",
       "options": {
         "baseURL": "http://localhost:4141/v1",
-        "apiKey": "dummy"
+        "apiKey": "<config.json 中的 auth.apiKeys[0]>"
       },
       "models": {
         "gpt-5.4": {
@@ -293,7 +295,7 @@ npx @jeffreycao/copilot-api@latest start
 
 - `npm: "@ai-sdk/anthropic"` 是关键。OpenCode 会以 Anthropic Messages 语义与这个 AI gateway 通信，而不是把一切扁平化为 OpenAI Chat Completions。
 - `options.baseURL` 应设为 `http://localhost:4141/v1`；Anthropic SDK 会自动补上 `/messages`、`/models` 和 `/messages/count_tokens`。
-- 如果你在此代理中启用了 `auth.apiKeys`，请把 `dummy` 替换为真实 key；否则任意占位值都可以。
+- 将客户端 API Key 设置为 `config.json` 中生成的 `auth.apiKeys[0]`。
 
 ## 与 Codex 一起使用
 
@@ -434,40 +436,9 @@ cp plugin/opencode/subagent-marker.js ~/.config/opencode/plugins/
 
 该插件会挂接到 `session.created`、`session.deleted`、`chat.message` 和 `chat.headers` 事件上，以无缝提供 subagent marker 能力。
 
-## 使用量查看器
+## 使用量监控
 
-服务启动后，控制台会输出一个 Copilot 使用量看板 URL。这个看板是一个用于监控 API 用量的 Web 界面。
-
-1. 启动服务。例如使用 npx：
-   ```sh
-   npx @jeffreycao/copilot-api@latest start
-   ```
-2. 服务会输出一个 usage viewer 的 URL。将它复制到浏览器中打开，形式大致如下：
-   `http://localhost:4141/usage-viewer?endpoint=http://localhost:4141/usage`
-   - 如果你在 Windows 上使用 `start.bat` 脚本，这个页面会自动打开。
-
-看板提供了更易读的 Copilot 用量视图：
-
-> token usage 历史记录需要 Bun 或 Node.js >= 22.13.0。Node.js < 22.13.0 时服务会正常运行，但 token usage 存储会被禁用。
-
-- **API Endpoint URL**：通过 URL 查询参数指定 API endpoints，默认指向本地服务。支持手动切换为其他兼容 endpoints。
-- **x-api-key 认证**：如果启用了 API Key 认证，可填入 `x-api-key` 请求头。密钥会持久化保存在浏览器本地存储中。
-- **Period 选择器**：支持 Day / Week / Month 三种时间范围，切换时 URL 参数会自动同步，方便收藏和分享。
-- **Fetch Data**：点击 "Refresh" 按钮加载或刷新使用数据。页面加载时也会自动拉取数据。
-- **Copilot Quotas 额度**：通过进度条展示 Chat、Completions 等不同服务的额度使用情况，悬停可查看已用/剩余详情。
-- **Token Usage 指标卡片**：汇总当前周期的 Total、Input、Output、Cache Read、Cache Write、Requests 和预估费用。
-- **趋势图（Week / Month）**：提供按模型和指标筛选的折线趋势图，点击数据点可查看单日用量明细。
-- **Model Breakdown 表格**：按模型维度列出周期内的请求数、输入/输出/缓存 token 和预计费用。
-- **Request Events 分页列表**：按时间排序的请求事件记录，支持分页浏览，含时间戳、模型、请求 ID 和 token 用量。
-- **Detailed Information**：展示 API 返回的完整 JSON 响应，便于深入分析所有可用统计数据。
-- **URL-based Configuration**：也可通过 `endpoint` 和 `period` 查询参数直接指定 API 端点与时间范围。例如：
-  `http://localhost:4141/usage-viewer?endpoint=http://your-api-server/usage&period=week`
-
-### Usage Viewer 截图
-
-<p align="center">
-  <img src="./docs/screenshots/usage-viewer.png" alt="Copilot API Usage Viewer 页面" width="900" />
-</p>
+为了避免浏览器存储或跨域发送 API Key，CLI 不再提供 Web Usage Viewer。请使用桌面应用查看可视化用量，或携带 `auth.apiKeys` 中的普通 API Key 调用 `/usage` 和 `/token-usage`。token usage 历史记录需要 Bun 或 Node.js >= 22.13.0。
 
 ## 命令结构
 
@@ -495,6 +466,7 @@ Copilot API 现在使用子命令结构，主要命令包括：
 
 | 选项 | 说明 | 默认值 | 别名 |
 | --- | --- | --- | --- |
+| --host | 监听地址；只有明确需要远程访问时才修改 | 127.0.0.1 | 无 |
 | --port | 监听端口 | 4141 | -p |
 | --verbose | 启用详细日志 | false | -v |
 | --github-token | 直接提供 GitHub token（必须通过 `auth` 子命令生成） | 无 | -g |
@@ -531,7 +503,7 @@ Copilot API 现在使用子命令结构，主要命令包括：
   ```json
   {
     "auth": {
-      "apiKeys": [],
+      "apiKeys": ["<startup 自动生成>"],
       "adminApiKey": "<startup 自动生成>"
     },
     "providers": {},
@@ -560,7 +532,7 @@ Copilot API 现在使用子命令结构，主要命令包括：
     "messageApiWebSearchModel": "gpt-5-mini"
   }
   ```
-- **auth.apiKeys：** 用于普通非 admin 路由的 API key。支持多个 key 轮换使用。请求可通过 `x-api-key: <key>` 或 `Authorization: Bearer <key>` 进行认证。若为空或省略，则普通路由的认证会被禁用。
+- **auth.apiKeys：** 用于普通非 admin 路由的 API key。支持多个 key 轮换使用。请求可通过 `x-api-key: <key>` 或 `Authorization: Bearer <key>` 进行认证。若为空或省略，服务会在启动时生成随机 key 并写回 `config.json`。
 - **auth.adminApiKey：** 仅用于 `/admin/*` 路由的单个 admin key。若未配置，服务会在启动时自动生成一个随机 key，并回写到 `config.json`。它同样使用 `x-api-key` 或 `Authorization: Bearer` 这两种头，但普通 `auth.apiKeys` 不能访问 `/admin/*`。
 - **modelMappings：** 用于顶层 `POST /v1/messages`、`POST /v1/messages/count_tokens`、`POST /v1/responses` 和 `POST /v1/chat/completions` 请求的精确 `sourceModel -> targetModel` 重写映射，这几类接口共用同一份规则。省略该字段或保留为 `{}` 时，不会做模型重写。`source` 和 `target` 都必须是非空字符串。`target` 可以是普通模型 ID，也可以是 `provider/model` 形式的别名，例如 `dashscope/qwen3.6-plus`；重写发生在 provider alias 解析之前。这些映射不再按接口区分。`GET/POST /admin/config/model-mappings` 管理接口读写的也只有这个字段。
 - **extraPrompts：** `model -> prompt` 的映射。把 Anthropic 风格请求翻译为 Responses API 时，会将其附加到第一条 system prompt 后面。你可以借此为不同模型注入护栏或指引。缺失的默认项会自动补齐，但不会覆盖你自定义的 prompt。对于 GPT-5.3+ 模型（如 `gpt-5.3-codex`、`gpt-5.4`、`gpt-5.5`），未显式配置时会自动使用内置的 commentary prompt。内置 prompt 会启用带阶段感知的 commentary，让模型在工具调用或更深层推理前先发出简短的用户可见进度说明。
@@ -652,13 +624,13 @@ Copilot API 现在使用子命令结构，主要命令包括：
 
 ## API 认证
 
-- **受保护的普通路由：** 当配置了 `auth.apiKeys` 且非空时，除 `/`、`/usage-viewer` 和 `/usage-viewer/` 以外的普通路由都需要认证。
+- **受保护的普通路由：** 除健康检查 `/` 以外的普通路由都需要 `auth.apiKeys` 认证。
 - **Admin 路由：** 所有 `/admin/*` 路由都要求 `auth.adminApiKey`。如果缺失，服务会在启动时自动生成并在开始提供服务前写回 `config.json`。
 - **允许的认证头：**
   - `x-api-key: <your_key>`
   - `Authorization: Bearer <your_key>`
-- **CORS 预检：** `OPTIONS` 请求始终允许。
-- **未配置普通 key 时：** 普通路由仍可直接访问；但这条规则不适用于 `/admin/*`，后者只接受 `auth.adminApiKey`。
+- **CORS：** CLI 服务默认不允许浏览器跨域读取响应。
+- **未配置普通 key 时：** 服务启动时会自动生成并持久化普通 key。
 
 普通受保护路由的示例请求：
 
@@ -724,7 +696,6 @@ curl http://localhost:4141/admin/config/model-mappings \
 | 端点 | 方法 | 说明 |
 | --- | --- | --- |
 | `GET /usage` | `GET` | 获取详细的 Copilot 使用统计与额度信息。 |
-| `GET /token` | `GET` | 获取当前 API 正在使用的 Copilot token。 |
 
 ### Admin / 配置端点
 

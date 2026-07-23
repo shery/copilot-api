@@ -24,7 +24,12 @@ let cleanupInterval: ReturnType<typeof setInterval> | undefined
 
 const ensureLogDirectory = () => {
   if (!fs.existsSync(LOG_DIR)) {
-    fs.mkdirSync(LOG_DIR, { recursive: true })
+    fs.mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 })
+  }
+  try {
+    fs.chmodSync(LOG_DIR, 0o700)
+  } catch {
+    return
   }
 }
 
@@ -146,7 +151,7 @@ const getLogStream = (filePath: string): fs.WriteStream => {
 
   let stream = logStreams.get(filePath)
   if (!stream || stream.destroyed) {
-    stream = fs.createWriteStream(filePath, { flags: "a" })
+    stream = fs.createWriteStream(filePath, { flags: "a", mode: 0o600 })
     logStreams.set(filePath, stream)
 
     stream.on("error", (error: unknown) => {

@@ -44,6 +44,8 @@ On the GitHub Copilot path, the gateway prefers Copilot's native Anthropic-style
 
 ## Installation
 
+For a first-time setup, see the [CLI Guide](./docs/CLI.md).
+
 To install dependencies, run:
 
 ```sh
@@ -116,7 +118,7 @@ Run the container with a bind mount so auth data survives restarts:
 
 ```sh
 mkdir -p ./copilot-data
-docker run -p 4141:4141 -v $(pwd)/copilot-data:/root/.local/share/copilot-api copilot-api
+docker run -p 127.0.0.1:4141:4141 -v $(pwd)/copilot-data:/root/.local/share/copilot-api copilot-api
 ```
 
 This stores GitHub auth data, provider config, and other gateway state in `./copilot-data` on the host, mapped to `/root/.local/share/copilot-api` in the container.
@@ -124,7 +126,7 @@ This stores GitHub auth data, provider config, and other gateway state in `./cop
 Or pass a GitHub token directly:
 
 ```sh
-docker run -p 4141:4141 -e GH_TOKEN=your_github_token_here copilot-api
+docker run -p 127.0.0.1:4141:4141 -e GH_TOKEN=your_github_token_here copilot-api
 ```
 
 ## Electron Desktop App
@@ -183,7 +185,7 @@ Here is an example `.claude/settings.json` file:
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:4141",
-    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_AUTH_TOKEN": "<auth.apiKeys[0] from config.json>",
     "ANTHROPIC_MODEL": "gpt-5.6-sol[1m]",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-sol[1m]",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-luna[1m]",
@@ -248,7 +250,7 @@ Example `~/.config/opencode/opencode.json`:
       "name": "My Local",
       "options": {
         "baseURL": "http://localhost:4141/v1",
-        "apiKey": "dummy"
+        "apiKey": "<auth.apiKeys[0] from config.json>"
       },
       "models": {
         "gpt-5.4": {
@@ -291,7 +293,7 @@ Why these fields matter:
 
 - `npm: "@ai-sdk/anthropic"` is the important part. OpenCode will speak Anthropic Messages semantics to this AI gateway instead of flattening everything into OpenAI Chat Completions.
 - `options.baseURL` should be `http://localhost:4141/v1`; the Anthropic SDK will append `/messages`, `/models`, and `/messages/count_tokens` automatically.
-- If you enable `auth.apiKeys` in this AI gateway, replace `dummy` with a real key. Otherwise any placeholder value is fine.
+- Set the client API key to the generated `auth.apiKeys[0]` value in `config.json`.
 
 ## Using with Codex
 
@@ -430,40 +432,9 @@ Or manually create the file at `~/.config/opencode/plugins/subagent-marker.js` w
 
 The plugin hooks into `session.created`, `session.deleted`, `chat.message`, and `chat.headers` events to provide seamless subagent marker functionality.
 
-## Using the Usage Viewer
+## Usage Monitoring
 
-After starting the server, a URL to the Copilot Usage Dashboard will be displayed in your console. This dashboard is a web interface for monitoring your API usage.
-
-1.  Start the server. For example, using npx:
-    ```sh
-    npx @jeffreycao/copilot-api@latest start
-    ```
-2.  The server will output a URL to the usage viewer. Copy and paste this URL into your browser. It will look something like this:
-    `http://localhost:4141/usage-viewer?endpoint=http://localhost:4141/usage`
-    - If you use the `start.bat` script on Windows, this page will open automatically.
-
-The dashboard provides a user-friendly interface to view your Copilot usage data:
-
-> Token usage history requires Bun or Node.js >= 22.13.0. On Node.js < 22.13.0, the server runs normally but token usage storage is disabled.
-
-- **API Endpoint URL**: The dashboard is pre-configured to fetch data from your local server endpoint via a URL query parameter. You can manually switch this to any other compatible API endpoint.
-- **x-api-key Authentication**: If API Key authentication is enabled, you can provide the `x-api-key` request header. The key is persisted in the browser's local storage.
-- **Period Selector**: Choose from Day, Week, or Month time ranges. The URL query parameter updates automatically when you switch, making it easy to bookmark and share.
-- **Fetch Data**: Click the "Refresh" button to load or refresh the usage data. The dashboard also fetches data automatically on page load.
-- **Copilot Quotas**: View quota usage for services such as Chat and Completions via progress bars. Hover over a card to see used/remaining details.
-- **Token Usage Metric Cards**: See a summary of Total, Input, Output, Cache Read, Cache Write, Requests, and estimated cost for the current period.
-- **Trend Chart (Week / Month)**: An interactive line chart with model and metric filters. Click a data point to inspect the usage breakdown for a specific day.
-- **Model Breakdown Table**: A per-model summary of requests, input/output/cache tokens, and estimated cost for the selected period.
-- **Request Events (Paginated)**: A time-sorted list of request event records with pagination support, showing timestamps, models, request IDs, and token counts.
-- **Detailed Information**: See the full JSON response from the API for a detailed breakdown of all available usage statistics.
-- **URL-based Configuration**: You can also specify the API endpoint and period directly via `endpoint` and `period` query parameters. For example:
-  `http://localhost:4141/usage-viewer?endpoint=http://your-api-server/usage&period=week`
-
-### Usage Viewer Screenshot
-
-<p align="center">
-  <img src="./docs/screenshots/usage-viewer.png" alt="Copilot API usage viewer" width="900" />
-</p>
+The CLI no longer serves the browser Usage Viewer so API keys cannot be stored or sent cross-origin by that page. Use the desktop app for a visual dashboard, or call `/usage` and `/token-usage` with a regular key from `auth.apiKeys`. Token usage history requires Bun or Node.js >= 22.13.0.
 
 ## Command Structure
 
@@ -491,6 +462,7 @@ The following command line options are available for the `start` command:
 
 | Option         | Description                                                                   | Default    | Alias |
 | -------------- | ----------------------------------------------------------------------------- | ---------- | ----- |
+| --host         | Host address to listen on                                                     | 127.0.0.1  | none  |
 | --port         | Port to listen on                                                             | 4141       | -p    |
 | --verbose      | Enable verbose logging                                                        | false      | -v    |
 | --github-token | Provide GitHub token directly (must be generated using the `auth` subcommand) | none       | -g    |
@@ -525,7 +497,7 @@ Use `copilot-api auth login --provider custom` to add or update another third-pa
   ```json
   {
     "auth": {
-      "apiKeys": [],
+      "apiKeys": ["<auto-generated-on-startup>"],
       "adminApiKey": "<auto-generated-on-startup>"
     },
     "providers": {},
@@ -554,7 +526,7 @@ Use `copilot-api auth login --provider custom` to add or update another third-pa
     "messageApiWebSearchModel": "gpt-5-mini"
   }
   ```
-- **auth.apiKeys:** API keys used for request authentication on non-admin routes. Supports multiple keys for rotation. Requests can authenticate with either `x-api-key: <key>` or `Authorization: Bearer <key>`. If empty or omitted, authentication for non-admin routes is disabled.
+- **auth.apiKeys:** API keys used for request authentication on non-admin routes. Supports multiple keys for rotation. Requests can authenticate with either `x-api-key: <key>` or `Authorization: Bearer <key>`. If empty or omitted, the server generates a random key at startup and writes it to `config.json`.
 - **auth.adminApiKey:** Single admin key used only for `/admin/*` routes. If missing, the server generates a random key at startup and writes it back to `config.json`. Requests use the same `x-api-key` or `Authorization: Bearer` headers, but regular `auth.apiKeys` never grant access to `/admin/*`.
 - **modelMappings:** Exact `sourceModel -> targetModel` rewrites shared by top-level `POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST /v1/responses`, and `POST /v1/chat/completions` requests. Omit it or leave it as `{}` to disable rewrites. Both the source and target must be non-empty strings. Targets can be regular model IDs or `provider/model` aliases such as `dashscope/qwen3.6-plus`, and the rewrite happens before provider alias parsing. These mappings are not split per interface. The admin endpoints `GET/POST /admin/config/model-mappings` read and update only this field.
 - **extraPrompts:** Map of `model -> prompt` appended to the first system prompt when translating Anthropic-style requests to Responses API. Use this to inject guardrails or guidance per model. Missing default entries are auto-added without overwriting your custom prompts. For GPT-5.3+ models (e.g. `gpt-5.3-codex`, `gpt-5.4`, `gpt-5.5`), a built-in commentary prompt is used as fallback when not explicitly configured. The built-in prompts enable phase-aware commentary, which lets the model emit a short user-facing progress update before tools or deeper reasoning.
@@ -646,13 +618,13 @@ Edit this file to customize prompts or swap in your own fast model. Restart the 
 
 ## API Authentication
 
-- **Protected non-admin routes:** All routes except `/`, `/usage-viewer`, and `/usage-viewer/` require authentication when `auth.apiKeys` is configured and non-empty.
+- **Protected non-admin routes:** All non-admin routes except the `/` health check require `auth.apiKeys` authentication.
 - **Admin routes:** All `/admin/*` routes require `auth.adminApiKey`. If it is missing, the server generates one at startup and persists it to `config.json` before serving requests.
 - **Allowed auth headers:**
   - `x-api-key: <your_key>`
   - `Authorization: Bearer <your_key>`
-- **CORS preflight:** `OPTIONS` requests are always allowed.
-- **When no regular keys are configured:** Non-admin routes continue to allow requests. This does not apply to `/admin/*`, which only accepts `auth.adminApiKey`.
+- **CORS:** The CLI server does not allow browser cross-origin response reads by default.
+- **When no regular keys are configured:** The server generates and persists a regular key at startup.
 
 Example request for a regular protected route:
 
@@ -718,7 +690,6 @@ New endpoints for monitoring your Copilot usage and quotas.
 | Endpoint     | Method | Description                                                  |
 | ------------ | ------ | ------------------------------------------------------------ |
 | `GET /usage` | `GET`  | Get detailed Copilot usage statistics and quota information. |
-| `GET /token` | `GET`  | Get the current Copilot token being used by the API.         |
 
 ### Admin / Configuration Endpoints
 
