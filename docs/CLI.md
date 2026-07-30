@@ -4,33 +4,29 @@ This guide covers running Copilot API locally from the command line. The CLI lis
 
 ## 1. Choose a runtime
 
-Run the published package:
-
-```sh
-npx @jeffreycao/copilot-api@latest --help
-```
-
-If Bun is installed, use it to enable complete token usage storage:
-
-```sh
-bunx --bun @jeffreycao/copilot-api@latest --help
-```
-
-Run from source:
+Run from source locally (recommended):
 
 ```sh
 bun install --frozen-lockfile
 bun run start --help
 ```
 
-The examples below use `npx @jeffreycao/copilot-api@latest`. Replace it with `bun run start` when running from source.
+You can also run the published package:
+
+```sh
+npx @jeffreycao/copilot-api@latest --help
+# or (Bun is recommended to enable complete token usage storage)
+bunx --bun @jeffreycao/copilot-api@latest --help
+```
+
+The examples below run the project scripts, such as `bun run start start`, `bun run auth ...`, and `bun run debug`. Replace them with `npx @jeffreycao/copilot-api@latest <command>` when using the published package.
 
 ## 2. Authenticate a provider
 
 For GitHub Copilot:
 
 ```sh
-npx @jeffreycao/copilot-api@latest auth login --provider copilot
+bun run auth login --provider copilot
 ```
 
 Complete the GitHub Device Flow shown in the terminal. An active GitHub Copilot subscription is required.
@@ -38,17 +34,17 @@ Complete the GitHub Device Flow shown in the terminal. An active GitHub Copilot 
 Other providers can be configured in the same way:
 
 ```sh
-npx @jeffreycao/copilot-api@latest auth login --provider codex
-npx @jeffreycao/copilot-api@latest auth login --provider dashscope
-npx @jeffreycao/copilot-api@latest auth login --provider deepseek
-npx @jeffreycao/copilot-api@latest auth login --provider openrouter
-npx @jeffreycao/copilot-api@latest auth login --provider custom
+bun run auth login --provider codex
+bun run auth login --provider dashscope
+bun run auth login --provider deepseek
+bun run auth login --provider openrouter
+bun run auth login --provider custom
 ```
 
 ## 3. Start the local server
 
 ```sh
-npx @jeffreycao/copilot-api@latest start
+bun run start start
 ```
 
 Default endpoint:
@@ -72,7 +68,7 @@ Configuration paths:
 Show the resolved paths and authentication status:
 
 ```sh
-npx @jeffreycao/copilot-api@latest debug
+bun run debug
 ```
 
 ## 4. Verify the server
@@ -115,7 +111,7 @@ export ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY
 ### Claude Code
 
 ```sh
-npx @jeffreycao/copilot-api@latest start --claude-code
+bun run start start --claude-code
 ```
 
 This generates a Claude Code environment command from the available models and copies it to the clipboard. The clipboard content contains the local API key; do not paste it into chats, issues, or logs.
@@ -124,13 +120,13 @@ This generates a Claude Code environment command from the available models and c
 
 ```sh
 # Change the port
-npx @jeffreycao/copilot-api@latest start --port 8080
+bun run start start --port 8080
 
 # Use proxy environment variables
-npx @jeffreycao/copilot-api@latest start --proxy-env
+bun run start start --proxy-env
 
 # Use a specific data directory
-npx @jeffreycao/copilot-api@latest --api-home=/safe/path start
+bun run start --api-home=/safe/path start
 ```
 
 Security defaults:
@@ -144,7 +140,7 @@ Security defaults:
 The default `127.0.0.1` binding only accepts local connections. Use the following only when LAN or reverse-proxy access is explicitly required:
 
 ```sh
-npx @jeffreycao/copilot-api@latest start --host 0.0.0.0
+bun run start start --host 0.0.0.0
 ```
 
 Before exposing the listener:
@@ -180,15 +176,17 @@ curl "http://localhost:4141/token-usage?period=week" \
 Print environment and path diagnostics:
 
 ```sh
-npx @jeffreycao/copilot-api@latest debug --json
+bun run debug --json
 ```
 
 ## 9. Update
 
-Commands using `@latest` resolve the latest published package. When running from source:
+When running from source locally, update with:
 
 ```sh
 git pull
 bun install --frozen-lockfile
 bun run build
 ```
+
+Commands using `@latest` with `npx`/`bunx` resolve the latest published package automatically.

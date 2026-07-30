@@ -25,8 +25,10 @@
     "dist"
   ],
   "scripts": {
+    "auth": "NODE_USE_SYSTEM_CA=1 bun run ./src/main.ts auth",
     "build": "tsdown",
     "build:desktop": "tsdown --config tsdown.desktop.config.ts",
+    "debug": "NODE_USE_SYSTEM_CA=1 bun run ./src/main.ts debug",
     "dev": "NODE_USE_SYSTEM_CA=1 bun run --watch ./src/main.ts",
     "knip": "knip-bun",
     "lint": "eslint --cache",
