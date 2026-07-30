@@ -7,28 +7,76 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: sync-upstream-dev
   cancel-in-progress: false
 
+env:
+  UPSTREAM_URL: https://github.com/caozhiyuan/copilot-api.git
+  UPSTREAM_BRANCH: dev
+  TARGET_BRANCH: dev
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout dev
+      - name: Checkout target branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: dev
+          ref: ${{ env.TARGET_BRANCH }}
 
-      - name: Merge upstream dev
+      - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/caozhiyuan/copilot-api.git
-          git fetch upstream dev
-          git merge --no-edit upstream/dev
 
-      - name: Push dev
-        run: git push origin HEAD:dev
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --tags upstream "$UPSTREAM_BRANCH"
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          behind=$(git rev-list --count HEAD..upstream/"$UPSTREAM_BRANCH")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "Already up to date with upstream/$UPSTREAM_BRANCH. Nothing to sync."
+          else
+            echo "Behind upstream by $behind commit(s)."
+          fi
+
+      - name: Merge upstream and push
+        if: steps.check.outputs.behind != '0'
+        id: merge
+        run: |
+          if git merge --no-edit upstream/"$UPSTREAM_BRANCH"; then
+            git push origin HEAD:"$TARGET_BRANCH"
+            echo "merged=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "merged=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::Automatic merge produced conflicts; opening a pull request instead."
+          fi
+
+      - name: Open sync pull request on conflict
+        if: steps.merge.outputs.merged == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short_sha=$(git rev-parse --short upstream/"$UPSTREAM_BRANCH")
+          sync_branch="chore/sync-upstream-${short_sha}"
+          if git ls-remote --exit-code --heads origin "$sync_branch" >/dev/null 2>&1; then
+            echo "Sync branch $sync_branch already exists; a pull request is likely open. Skipping."
+            exit 0
+          fi
+          git push origin "upstream/${UPSTREAM_BRANCH}:refs/heads/${sync_branch}"
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$sync_branch" \
+            --title "chore: sync upstream ${UPSTREAM_BRANCH} (${short_sha})" \
+            --body "Automatic upstream sync could not be merged cleanly due to conflicts. Please resolve the conflicts and merge this pull request." \
+            || echo "Pull request may already exist for $sync_branch."
