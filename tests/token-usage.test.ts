@@ -286,6 +286,53 @@ describe("token usage storage", () => {
     ])
   })
 
+  test("records provider-reported cost before configured pricing", async () => {
+    recordTokenUsageEvent({
+      cost: 0.0002928408,
+      endpoint: "provider_messages",
+      input_tokens: 853,
+      model: "claude-sonnet-4",
+      output_tokens: 284,
+      pricing: {
+        input: 100,
+        output: 100,
+      },
+      pricingCurrency: "USD",
+      providerName: "openrouter",
+      source: "provider",
+    })
+
+    const page = await fetchEventsPage()
+    expect(page.items[0]?.cost).toEqual({
+      amount: 0.000292841,
+      currency: "USD",
+      source: "upstream",
+      total_cost_nanos: 292_841,
+    })
+  })
+
+  test("does not use provider-reported cost for non-OpenRouter providers", () => {
+    expect(
+      resolveTokenUsageCost({
+        cost: 0.0002928408,
+        input_tokens: 10,
+        model: "custom-model",
+        output_tokens: 5,
+        pricing: {
+          input: 1,
+          output: 2,
+        },
+        pricingCurrency: "USD",
+        providerName: "anthropic",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "USD",
+      source: "config",
+      total_cost_nanos: 20_000,
+    })
+  })
+
   test("uses GPT-5.6 Terra and Luna long-context and cache-write prices", () => {
     const expectedCosts = [
       { model: "gpt-5.6-terra", totalCostNanos: 1_140_800_000 },
@@ -309,6 +356,47 @@ describe("token usage storage", () => {
         total_cost_nanos: totalCostNanos,
       })
     }
+  })
+
+  test("prices OpenCode Go Hy3 and GPT-5.6 Luna with long-context tiers", () => {
+    const shortContextCosts = [
+      { model: "hy3", totalCostNanos: 1_950_000 },
+      { model: "gpt-5.6-luna", totalCostNanos: 2_045_000 },
+    ]
+
+    for (const { model, totalCostNanos } of shortContextCosts) {
+      expect(
+        resolveTokenUsageCost({
+          cache_creation_input_tokens: 1_000,
+          cache_read_input_tokens: 2_000,
+          input_tokens: 1_000,
+          model,
+          output_tokens: 3_000,
+          providerName: "opencode-go",
+          source: "provider",
+        }),
+      ).toEqual({
+        currency: "USD",
+        source: "builtin",
+        total_cost_nanos: totalCostNanos,
+      })
+    }
+
+    expect(
+      resolveTokenUsageCost({
+        cache_creation_input_tokens: 2_000,
+        cache_read_input_tokens: 2_000,
+        input_tokens: 269_000,
+        model: "gpt-5.6-luna",
+        output_tokens: 3_000,
+        providerName: "opencode-go",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "USD",
+      source: "builtin",
+      total_cost_nanos: 57_040_000,
+    })
   })
 
   test("only falls back to interaction id when no real session id exists", async () => {
