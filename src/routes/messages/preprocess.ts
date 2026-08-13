@@ -1,4 +1,4 @@
-import type { Model } from "~/services/copilot/get-models"
+import type { Model } from "~/lib/types/models"
 
 import {
   COMPACT_AUTO_CONTINUE,
@@ -26,7 +26,7 @@ import type {
   AnthropicToolResultContentBlock,
   AnthropicUserContentBlock,
   AnthropicUserMessage,
-} from "./anthropic-types"
+} from "~/lib/types/anthropic"
 
 export const TOOL_REFERENCE_TURN_BOUNDARY = "Tool loaded."
 const SYSTEM_REMINDER_START = "<system-reminder>"
@@ -883,9 +883,16 @@ const filterAssistantThinkingBlocks = (
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       msg.content = msg.content.filter((block) => {
         if (block.type !== "thinking") return true
+        // Keep signature-only blocks (empty `thinking` text). On the Anthropic
+        // Messages API it is the signature, not the summary text, that carries
+        // reasoning continuity across turns, and Copilot's upstream frequently
+        // returns thinking blocks with an empty summary. Requiring non-empty
+        // text here silently drops those blocks — and their signatures — so the
+        // reasoning chain breaks on exactly those turns. The `"Thinking..."`
+        // placeholder is still excluded: it is a synthetic value this project
+        // adds for clients that filter empty text, never real model output.
         return (
-          block.thinking
-          && block.thinking !== "Thinking..."
+          block.thinking !== "Thinking..."
           && block.signature
           && !block.signature.includes("@")
         )
