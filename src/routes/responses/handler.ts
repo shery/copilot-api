@@ -8,9 +8,12 @@ import {
 } from "~/lib/config"
 import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
 import { findEndpointModel } from "~/lib/models"
-import { parseProviderModelAlias } from "~/lib/provider-model"
+import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
 import { isCodexUserAgent } from "~/routes/models/codex-models"
-import { handleProviderResponsesForProvider } from "~/routes/provider/responses/handler"
+import {
+  handleProviderResponsesForProvider,
+  providerResponsesHandlerDependencies,
+} from "~/routes/provider/responses/handler"
 import {
   createCopilotTokenUsageRecorder,
   normalizeOptionalToken,
@@ -38,6 +41,8 @@ import {
   compactInputByLatestCompaction,
   getResponsesTransportForModel,
   getResponsesRequestOptions,
+  normalizeInputImageDetails,
+  normalizeResponsesReasoningEffort,
   sanitizeOversizedInputImages,
   sanitizeUnsupportedInputFields,
 } from "./utils"
@@ -62,7 +67,10 @@ export const handleResponses = async (c: Context) => {
     )
   }
 
-  const providerModelAlias = parseProviderModelAlias(payload.model)
+  const providerModelAlias = await resolveConfiguredProviderModelAlias(
+    payload.model,
+    providerResponsesHandlerDependencies.resolveProviderConfig,
+  )
   if (providerModelAlias) {
     payload.model = providerModelAlias.model
     return await handleProviderResponsesForProvider(c, {
@@ -93,6 +101,15 @@ export const handleResponses = async (c: Context) => {
     payload.model,
   )
   payload.model = selectedModel?.id ?? payload.model
+  const normalizedReasoningEffort = normalizeResponsesReasoningEffort(
+    payload,
+    selectedModel?.capabilities?.supports?.reasoning_effort,
+  )
+  if (normalizedReasoningEffort) {
+    logger.debug(
+      `Normalized reasoning effort from ${normalizedReasoningEffort.from} to ${normalizedReasoningEffort.to} based on the selected model capabilities`,
+    )
+  }
   const responsesTransport = getResponsesTransportForModel(selectedModel)
 
   const useMessagesFallback = shouldFallbackToMessages(
@@ -135,6 +152,13 @@ export const handleResponses = async (c: Context) => {
   if (sanitizedUnsupportedFieldCount > 0) {
     logger.debug(
       `Removed ${sanitizedUnsupportedFieldCount} unsupported input field(s) before forwarding to Copilot Responses`,
+    )
+  }
+
+  const normalizedImageDetailCount = normalizeInputImageDetails(payload)
+  if (normalizedImageDetailCount > 0) {
+    logger.debug(
+      `Normalized ${normalizedImageDetailCount} unsupported input image detail value(s) before forwarding to Copilot Responses`,
     )
   }
 
@@ -254,7 +278,7 @@ const shouldFallbackToMessages = (
   responsesTransport: ResponsesTransport | null,
 ): boolean => {
   if (isCodexUserAgent(c.req.header("user-agent"))) {
-    return !modelId.startsWith("gpt")
+    return !(modelId.startsWith("gpt") || modelId.startsWith("codex"))
   }
 
   if (responsesTransport) {

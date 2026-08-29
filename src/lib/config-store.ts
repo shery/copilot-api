@@ -4,6 +4,7 @@ import fs from "node:fs"
 
 import type { TokenUsagePricingConfig } from "~/lib/token-usage/pricing"
 
+import { writeFileAtomically } from "./atomic-file"
 import { PATHS } from "./paths"
 
 export interface AppConfig {
@@ -52,7 +53,7 @@ export interface ContextManagementConfig {
 }
 
 export interface ResponsesTransportConfig {
-  headersTimeoutMs?: number
+  headersTimeoutMsV2?: number
   streamInactivityTimeoutMs?: number
   websocketMaxBufferedBytes?: number
   websocketMaxBufferedMessages?: number
@@ -61,7 +62,7 @@ export interface ResponsesTransportConfig {
 }
 
 export const defaultResponsesTransportConfig = {
-  headersTimeoutMs: 30_000,
+  headersTimeoutMsV2: 5 * 60 * 1000,
   streamInactivityTimeoutMs: 5 * 60 * 1000,
   websocketMaxBufferedBytes: 8 * 1024 * 1024,
   websocketMaxBufferedMessages: 1024,
@@ -187,15 +188,15 @@ function ensureApiKeys(config: AppConfig): {
   mergedConfig: AppConfig
   changed: boolean
 } {
-  const apiKeys = config.auth?.apiKeys
-    ?.filter((key): key is string => typeof key === "string")
-    .map((key) => key.trim())
-    .filter(Boolean)
-
-  if (apiKeys && apiKeys.length > 0) {
+  const configuredApiKeys = config.auth?.apiKeys
+  if (Array.isArray(configuredApiKeys)) {
+    const apiKeys = configuredApiKeys
+      .filter((key): key is string => typeof key === "string")
+      .map((key) => key.trim())
+      .filter(Boolean)
     const normalizedApiKeys = [...new Set(apiKeys)]
     const changed =
-      JSON.stringify(config.auth?.apiKeys) !== JSON.stringify(normalizedApiKeys)
+      JSON.stringify(configuredApiKeys) !== JSON.stringify(normalizedApiKeys)
     return {
       mergedConfig:
         changed ?
@@ -228,11 +229,9 @@ function ensureConfigFile(): void {
   try {
     fs.accessSync(PATHS.CONFIG_PATH, fs.constants.R_OK | fs.constants.W_OK)
   } catch {
-    fs.mkdirSync(PATHS.APP_DIR, { recursive: true })
-    fs.writeFileSync(
+    writeFileAtomically(
       PATHS.CONFIG_PATH,
       `${JSON.stringify(defaultConfig, null, 2)}\n`,
-      "utf8",
     )
     try {
       fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
@@ -244,20 +243,25 @@ function ensureConfigFile(): void {
 
 function readConfigFromDisk(): AppConfig {
   ensureConfigFile()
+  const raw = fs.readFileSync(PATHS.CONFIG_PATH, "utf8")
+  if (!raw.trim()) {
+    writeFileAtomically(
+      PATHS.CONFIG_PATH,
+      `${JSON.stringify(defaultConfig, null, 2)}\n`,
+    )
+    return defaultConfig
+  }
+
   try {
-    const raw = fs.readFileSync(PATHS.CONFIG_PATH, "utf8")
-    if (!raw.trim()) {
-      fs.writeFileSync(
-        PATHS.CONFIG_PATH,
-        `${JSON.stringify(defaultConfig, null, 2)}\n`,
-        "utf8",
-      )
-      return defaultConfig
-    }
     return JSON.parse(raw) as AppConfig
   } catch (error) {
-    consola.error("Failed to read config file, using default config", error)
-    return defaultConfig
+    // Fail closed: falling back to the default config here would let the
+    // startup merge overwrite the corrupt file (discarding providers, API
+    // keys, and model mappings) and, because the default has no apiKeys,
+    // silently disable API key authentication on normal routes.
+    const message = `Config file is not valid JSON: ${PATHS.CONFIG_PATH}. Refusing to start with the default config. Fix the JSON syntax or delete the file to regenerate a fresh config.`
+    consola.error(message, error)
+    throw new Error(message, { cause: error })
   }
 }
 
@@ -280,16 +284,25 @@ export function readEditableConfigFromDisk(): AppConfig {
 }
 
 export function writeConfigToDisk(config: AppConfig): void {
-  fs.mkdirSync(PATHS.APP_DIR, { recursive: true })
-  fs.writeFileSync(PATHS.CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
+  writeFileAtomically(PATHS.CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
+}
+
+export function setConfiguredApiKeys(apiKeys: Array<string>): Array<string> {
+  const normalizedKeys = apiKeys
+    .map((key) => key.trim())
+    .filter((key) => key.length > 0)
+  const uniqueKeys = [...new Set(normalizedKeys)]
+
+  const editableConfig = readEditableConfigFromDisk()
+  writeConfigToDisk({
+    ...editableConfig,
+    auth: {
+      ...editableConfig.auth,
+      apiKeys: uniqueKeys,
+    },
   })
-  try {
-    fs.chmodSync(PATHS.CONFIG_PATH, 0o600)
-  } catch {
-    return
-  }
+  reloadConfig()
+  return [...uniqueKeys]
 }
 
 function mergeDefaultConfig(config: AppConfig): {
@@ -472,16 +485,19 @@ export function isResponsesApiWebSocketEnabled(): boolean {
   return config.useResponsesApiWebSocket ?? true
 }
 
-export function getResponsesTransportConfig(): Required<ResponsesTransportConfig> {
-  return normalizeResponsesTransportConfig(getConfig().responsesTransport)
+export function getResponsesTransportConfig() {
+  const { headersTimeoutMsV2, ...config } = normalizeResponsesTransportConfig(
+    getConfig().responsesTransport,
+  )
+  return { headersTimeoutMs: headersTimeoutMsV2, ...config }
 }
 
 export const normalizeResponsesTransportConfig = (
   configured: ResponsesTransportConfig | undefined,
 ): Required<ResponsesTransportConfig> => ({
-  headersTimeoutMs: positiveIntegerOrDefault(
-    configured?.headersTimeoutMs,
-    defaultResponsesTransportConfig.headersTimeoutMs,
+  headersTimeoutMsV2: positiveIntegerOrDefault(
+    configured?.headersTimeoutMsV2,
+    defaultResponsesTransportConfig.headersTimeoutMsV2,
   ),
   streamInactivityTimeoutMs: positiveIntegerOrDefault(
     configured?.streamInactivityTimeoutMs,
