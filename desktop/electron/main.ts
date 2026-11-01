@@ -5,8 +5,12 @@ import {
   Menu,
   nativeImage,
   nativeTheme,
+  ipcMain,
+  net,
+  shell,
 } from 'electron'
 import path from 'node:path'
+import electronUpdater from 'electron-updater'
 
 import { bindElectronFetch } from '../../src/lib/electron-fetch'
 import type {
@@ -34,6 +38,31 @@ import {
   readSettingsSync,
   setLaunchAtLoginFallback,
 } from './settings-store'
+import { applySettingsEnvOverrides } from './settings-env'
+import { createUpdateManager } from './update-manager'
+import { checkReleaseUpdate } from './release-update'
+import { MacDmgUpdater } from './mac-dmg-updater'
+import {
+  beginMacUpdateStartup,
+  canInstallMacUpdate,
+  getMacApplicationPath,
+  installMacUpdate,
+  markMacUpdateReady,
+} from './mac-update-install'
+
+const macAppPath =
+  process.platform === 'darwin' && app.isPackaged ?
+    getMacApplicationPath(process.execPath)
+  : null
+const macUpdateStartup =
+  macAppPath ?
+    beginMacUpdateStartup(
+      process.argv,
+      app.getPath('userData'),
+      macAppPath,
+      app.getVersion(),
+    )
+  : Promise.resolve(null)
 
 const CLI_ENV_FLAGS = {
   '--api-home': 'COPILOT_API_HOME',
@@ -69,6 +98,9 @@ const noProxyServerOverride = hasNoProxyServerSwitch(process.argv)
 const initialSettings = readSettingsSync()
 applySettingsEnvOverrides(initialSettings)
 applyElectronProxyCommandLine(getEffectiveProxySettings(initialSettings))
+// QUIC runs over UDP, which proxies and some networks cannot carry. Keep the
+// Chromium network stack (used through bindElectronFetch) on TCP.
+app.commandLine.appendSwitch('disable-quic')
 bindElectronFetch()
 
 function resolveNativeBackgroundColor(theme: ThemePreference): string {
@@ -100,22 +132,6 @@ function getEffectiveProxySettings(
 }
 
 let runtimeDependenciesPromise: Promise<RuntimeDependencies> | null = null
-
-function applySettingsEnvOverrides(settings: DesktopSettings): void {
-  const apiHome = settings.apiHome.trim()
-  if (!process.env.COPILOT_API_HOME && apiHome) {
-    process.env.COPILOT_API_HOME = apiHome
-  }
-
-  if (!process.env.COPILOT_API_OAUTH_APP && settings.oauthApp === 'opencode') {
-    process.env.COPILOT_API_OAUTH_APP = 'opencode'
-  }
-
-  const enterpriseUrl = settings.enterpriseUrl.trim()
-  if (!process.env.COPILOT_API_ENTERPRISE_URL && enterpriseUrl) {
-    process.env.COPILOT_API_ENTERPRISE_URL = enterpriseUrl
-  }
-}
 
 function warmOpencodeVersion(): void {
   void import('../../src/lib/opencode')
@@ -273,6 +289,11 @@ function createWindow(startHidden = false): BrowserWindow {
   else win.maximize()
 
   win.once('ready-to-show', () => {
+    void macUpdateStartup
+      .then(markMacUpdateReady)
+      .catch((error) =>
+        console.error('Cannot acknowledge macOS update:', error),
+      )
     if (!startHidden) {
       win.show()
     }
@@ -338,6 +359,86 @@ async function initializeApplication(): Promise<void> {
     await getRuntimeDependencies()
   const settings = await readSettings()
   await applyElectronProxy(getEffectiveProxySettings(settings))
+
+  const macUpdater =
+    macAppPath ? new MacDmgUpdater(app.getPath('downloads')) : null
+  const autoUpdater = macUpdater ?? electronUpdater.autoUpdater
+  const macCanInstall =
+    macAppPath ?
+      !process.argv.includes('--copilot-api-update-failed')
+      && (await canInstallMacUpdate(macAppPath))
+    : false
+  const beforeInstall = async () => {
+    const { stopServer } = await getRuntimeDependencies()
+    await stopServer()
+    isQuitting = true
+  }
+  const updateManager = createUpdateManager(autoUpdater, {
+    currentVersion: app.getVersion(),
+    enabled: app.isPackaged,
+    nativeUpdates:
+      process.platform === 'win32'
+      || Boolean(macAppPath)
+      || (process.platform === 'linux' && Boolean(process.env.APPIMAGE)),
+    packageUpdates: Boolean(macAppPath),
+    installPackage:
+      macAppPath && macUpdater && macCanInstall ?
+        async (file, version) => {
+          await macUpdater.verifyPackage(file)
+          await installMacUpdate({
+            appPath: macAppPath,
+            dmgPath: file,
+            version,
+            userData: app.getPath('userData'),
+            beforeQuit: beforeInstall,
+            quit: () => app.quit(),
+          })
+        }
+      : undefined,
+    checkRelease: () =>
+      checkReleaseUpdate(
+        (url, options) => net.fetch(url, options),
+        app.getVersion(),
+        process.platform,
+        process.arch,
+      ),
+    beforeInstall,
+    onStatus: (status) => {
+      if (status.phase === 'downloaded' && status.error) isQuitting = false
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed())
+          window.webContents.send('update:status', status)
+      }
+    },
+  })
+  ipcMain.handle('update:get-status', () => updateManager.getStatus())
+  ipcMain.handle('update:check', () => updateManager.check())
+  ipcMain.handle('update:install', () => updateManager.install())
+  ipcMain.handle(
+    'update:open-package',
+    async (_event, showInFolder: unknown) => {
+      const file = updateManager.getDownloadedFile()
+      if (!macAppPath || !file)
+        throw new Error('No downloaded macOS update package')
+      if (showInFolder === true) shell.showItemInFolder(file)
+      else {
+        await macUpdater?.verifyPackage(file)
+        const error = await shell.openPath(file)
+        if (error) throw new Error(error)
+      }
+    },
+  )
+  if (app.isPackaged) {
+    const startupCheck = setTimeout(() => void updateManager.check(), 15_000)
+    const periodicCheck = setInterval(
+      () => void updateManager.check(),
+      6 * 60 * 60 * 1000,
+    )
+    app.once('before-quit', () => {
+      clearTimeout(startupCheck)
+      clearInterval(periodicCheck)
+    })
+  }
 
   const launchedAtLogin = wasLaunchedAtLogin(app)
 

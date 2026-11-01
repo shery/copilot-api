@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
@@ -8,6 +16,8 @@ import type {
 } from "~/lib/types/anthropic"
 import type { ResponsesResult } from "~/lib/types/responses"
 
+import { createFallbackModel } from "~/lib/provider-model"
+
 const actualConfigModule = await import("~/lib/config")
 const actualModelsModule = await import("~/lib/models")
 const actualStateModule = await import("~/lib/state")
@@ -16,25 +26,21 @@ const actualTokenUsageModule = await import("~/lib/token-usage")
 
 let providerConfigs: Record<string, ResolvedProviderConfig> = {}
 let messageApiWebSearchModel: string | undefined
+let restoreModelLookup = () => {}
 
 const noopTokenUsageRecorder = () => {}
+let restoreTokenUsageRecorder = () => {}
 const findEndpointModel = mock((model: string) => ({
-  id: model,
+  ...createFallbackModel(model),
   supported_endpoints: ["/v1/messages"],
 }))
 
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
-  getMessageApiWebSearchModel: () => messageApiWebSearchModel,
   getProviderConfig: (name: string) => providerConfigs[name] ?? null,
   isResponsesApiWebSearchEnabled: () => true,
   isResponsesApiWebSocketEnabled: () => false,
   resolveMappedModel: (model: string) => model,
-}))
-
-await mock.module("~/lib/models", () => ({
-  ...actualModelsModule,
-  findEndpointModel,
 }))
 
 await mock.module("~/lib/state", () => ({
@@ -51,21 +57,21 @@ await mock.module("~/lib/token", () => ({
   setupCodexToken: async () => {},
 }))
 
-await mock.module("~/lib/token-usage", () => ({
-  ...actualTokenUsageModule,
-  createProviderTokenUsageRecorder: () => noopTokenUsageRecorder,
-}))
-
 const { providerMessageRoutes } = await import(
   "~/routes/provider/messages/route"
 )
 const { messageRoutes } = await import("~/routes/messages/route")
+const { webSearchFlowDependencies } = await import(
+  "~/routes/messages/web-search/fulfill"
+)
 const { state } = await import("~/lib/state")
 const { responsesUtilsDependencies } = await import("~/routes/responses/utils")
 
 const originalCodexAccessToken = state.codexAccessToken
 const originalCodexAccountId = state.codexAccountId
 const defaultResponsesUtilsDependencies = { ...responsesUtilsDependencies }
+const originalGetMessageApiWebSearchModel =
+  webSearchFlowDependencies.getMessageApiWebSearchModel
 
 const makeResponsesResult = (
   overrides: Partial<ResponsesResult> = {},
@@ -336,6 +342,17 @@ const createCodexMessagesPayload = (
 })
 
 beforeEach(() => {
+  const recorder = spyOn(
+    actualTokenUsageModule,
+    "createProviderTokenUsageRecorder",
+  ).mockImplementation(() => noopTokenUsageRecorder)
+  restoreTokenUsageRecorder = () => recorder.mockRestore()
+  const modelLookup = spyOn(
+    actualModelsModule,
+    "findEndpointModel",
+  ).mockImplementation(findEndpointModel)
+  restoreModelLookup = () => modelLookup.mockRestore()
+
   providerConfigs = {
     search: {
       name: "search",
@@ -353,6 +370,8 @@ beforeEach(() => {
   state.codexAccessToken = "codex-token"
   state.codexAccountId = "codex-account"
   messageApiWebSearchModel = undefined
+  webSearchFlowDependencies.getMessageApiWebSearchModel = () =>
+    messageApiWebSearchModel
   responsesResultOverride = undefined
   responsesStreamFactory = undefined
   findEndpointModel.mockClear()
@@ -367,10 +386,14 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  restoreTokenUsageRecorder()
+  restoreModelLookup()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   state.codexAccessToken = originalCodexAccessToken
   state.codexAccountId = originalCodexAccountId
   Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
+  webSearchFlowDependencies.getMessageApiWebSearchModel =
+    originalGetMessageApiWebSearchModel
   providerConfigs = {}
   messageApiWebSearchModel = undefined
   responsesResultOverride = undefined

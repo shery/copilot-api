@@ -78,20 +78,33 @@ describe("config admin api key", () => {
 
   test("keeps a generated regular api key stable across startup merges", () => {
     const tempDir = createTempConfigDir()
-    const configPath = writeConfigFile(tempDir, { auth: { apiKeys: [] } })
+    const configPath = path.join(tempDir, "config.json")
 
     runConfigScript(
       tempDir,
       'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
     )
     const generatedApiKey = readConfigFile(configPath).auth?.apiKeys?.[0]
+    expect(generatedApiKey).toHaveLength(64)
 
     runConfigScript(
       tempDir,
       'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
     )
 
-    expect(readConfigFile(configPath).auth?.apiKeys?.[0]).toBe(generatedApiKey)
+    expect(readConfigFile(configPath).auth?.apiKeys).toEqual([generatedApiKey!])
+  })
+
+  test("keeps explicitly cleared regular api keys empty", () => {
+    const tempDir = createTempConfigDir()
+    const configPath = writeConfigFile(tempDir, { auth: { apiKeys: [] } })
+
+    runConfigScript(
+      tempDir,
+      'const { mergeConfigWithDefaults } = await import("./src/lib/config"); mergeConfigWithDefaults();',
+    )
+
+    expect(readConfigFile(configPath).auth?.apiKeys).toEqual([])
   })
 
   test("restricts config file permissions when writing", () => {
@@ -107,6 +120,32 @@ describe("config admin api key", () => {
     )
 
     expect(fs.statSync(configPath).mode & 0o777).toBe(0o600)
+  })
+
+  test("merges default model mappings without replacing user entries", () => {
+    const tempDir = createTempConfigDir()
+    const configPath = writeConfigFile(tempDir, {
+      auth: { adminApiKey: "existing-admin-key" },
+      modelMappings: {
+        "codex-auto-review": "gpt-5.6-luna",
+        custom: "provider/model",
+      },
+    })
+
+    runConfigScript(
+      tempDir,
+      `import assert from "node:assert/strict";
+       const { mergeConfigWithDefaults, resolveMappedModel } = await import("./src/lib/config");
+       mergeConfigWithDefaults();
+       assert.equal(resolveMappedModel("codex-auto-review"), "gpt-5.6-luna");
+       assert.equal(resolveMappedModel("gpt-reserve"), "codex/gpt-reserve");
+       assert.equal(resolveMappedModel("custom"), "provider/model");`,
+    )
+    expect(readConfigFile(configPath).modelMappings).toEqual({
+      "codex-auto-review": "gpt-5.6-luna",
+      "gpt-reserve": "codex/gpt-reserve",
+      custom: "provider/model",
+    })
   })
 
   test("generates and persists an admin api key when missing", () => {
@@ -130,6 +169,8 @@ describe("config admin api key", () => {
     expect(typeof config.auth?.adminApiKey).toBe("string")
     expect(config.auth?.adminApiKey?.length).toBeGreaterThan(0)
     expect(config.modelMappings).toEqual({
+      "codex-auto-review": "codex/codex-auto-review",
+      "gpt-reserve": "codex/gpt-reserve",
       "claude-opus-4-7": "gpt-5-mini",
     })
   })
@@ -174,6 +215,8 @@ describe("config admin api key", () => {
     const config = readConfigFile(configPath)
     expect(config.auth?.adminApiKey).toBe(generatedAdminApiKey)
     expect(config.modelMappings).toEqual({
+      "codex-auto-review": "codex/codex-auto-review",
+      "gpt-reserve": "codex/gpt-reserve",
       "claude-opus-4-7": "dash/qwen-plus",
     })
   })
@@ -209,6 +252,8 @@ describe("config admin api key", () => {
     expect(config.auth?.adminApiKey?.length).toBeGreaterThan(0)
     expect(config.auth?.adminApiKey).not.toBe(generatedAdminApiKey)
     expect(config.modelMappings).toEqual({
+      "codex-auto-review": "codex/codex-auto-review",
+      "gpt-reserve": "codex/gpt-reserve",
       "claude-opus-4-7": "gpt-5-mini",
     })
   })

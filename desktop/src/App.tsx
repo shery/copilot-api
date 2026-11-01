@@ -30,7 +30,11 @@ export default function App() {
   const [page, setPage] = useState<Page | null>(null)
   const [authMode, setAuthMode] = useState<DesktopAuthMode>('none')
   const [canReturnFromAuth, setCanReturnFromAuth] = useState(false)
+  const [dashboardTab, setDashboardTab] = useState<'dashboard' | 'providers'>(
+    'dashboard',
+  )
   const [port, setPort] = useState<number>(4141)
+  const [host, setHost] = useState<string>('')
   const [initialServerStatus, setInitialServerStatus] = useState<ServerStatus>()
   const { setLangPref, t } = useLanguage()
 
@@ -47,6 +51,7 @@ export default function App() {
         if (!active) return
 
         setPort(settings.lastPort)
+        setHost(settings.host ?? '')
         setLangPref(settings.language ?? 'auto')
 
         if (authResult.success && authResult.mode !== 'none') {
@@ -88,13 +93,19 @@ export default function App() {
     setPage('dashboard')
   }
 
-  const handleChangeAuth = () => {
+  const handleChangeAuth = (returnTab: 'dashboard' | 'providers') => {
+    setDashboardTab(returnTab)
     setInitialServerStatus(undefined)
     setCanReturnFromAuth(true)
     setPage('auth')
   }
 
-  const handleBackToDashboard = () => {
+  const handleBackToDashboard = async () => {
+    try {
+      setInitialServerStatus(await window.electronAPI.getServerStatus())
+    } catch {
+      setInitialServerStatus(undefined)
+    }
     setCanReturnFromAuth(false)
     setPage('dashboard')
   }
@@ -106,7 +117,10 @@ export default function App() {
   if (page === 'auth') {
     return (
       <AuthPage
-        onBack={canReturnFromAuth ? handleBackToDashboard : undefined}
+        backTarget={dashboardTab === 'providers' ? 'providers' : 'home'}
+        onBack={
+          canReturnFromAuth ? () => void handleBackToDashboard() : undefined
+        }
         onSuccess={handleAuthSuccess}
       />
     )
@@ -116,7 +130,9 @@ export default function App() {
     <DashboardPage
       authMode={authMode}
       defaultPort={port}
+      defaultHost={host}
       initialServerStatus={initialServerStatus}
+      initialTab={dashboardTab}
       onChangeAuth={handleChangeAuth}
     />
   )

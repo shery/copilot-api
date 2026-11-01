@@ -110,11 +110,18 @@ export ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY
 
 ### Claude Code
 
-```sh
-bun run start start --claude-code
+Put the gateway URL and your regular key in `.claude/settings.json` (the `--claude-code` flag no longer exists):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:4141",
+    "ANTHROPIC_AUTH_TOKEN": "<auth.apiKeys[0] from config.json>"
+  }
+}
 ```
 
-This generates a Claude Code environment command from the available models and copies it to the clipboard. The clipboard content contains the local API key; do not paste it into chats, issues, or logs.
+See the [Claude Code guide](./guides/en/claude-code.md) for model mappings and the remaining environment variables. The settings file contains the local API key; do not paste it into chats, issues, or logs.
 
 ## 6. Common options
 
@@ -150,16 +157,17 @@ Before exposing the listener:
 3. Put public access behind an HTTPS reverse proxy.
 4. Never expose the configuration, credential, or log directories.
 
-For a local-only Docker mapping:
+For a local-only Docker mapping, use the supplied Compose file, which publishes the port on `127.0.0.1` unless `COPILOT_API_BIND` is set, stores state in `./copilot-data` mounted at `/data`, and runs the server as the non-root `bun` user:
 
 ```sh
-docker run \
-  -p 127.0.0.1:4141:4141 \
-  -v "$(pwd)/copilot-data:/root/.local/share/copilot-api" \
-  copilot-api
+mkdir -p copilot-data
+docker compose pull
+docker compose run --rm copilot-api --auth keys --add YOUR_GATEWAY_API_KEY
+docker compose run --rm copilot-api --auth login
+docker compose up -d
 ```
 
-The image entrypoint binds the service to all interfaces inside the container while the host-side `127.0.0.1:4141:4141` mapping keeps access local.
+Inside the container the entrypoint defaults `HOST` to `0.0.0.0`, so the host-side `127.0.0.1:4141:4141` mapping is what keeps access local. See the [Docker guide](./guides/en/docker.md) for environment variables and data-directory ownership repair.
 
 ## 8. Usage and diagnostics
 

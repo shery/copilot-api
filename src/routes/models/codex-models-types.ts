@@ -17,6 +17,7 @@ export interface CodexModel {
   tool_mode: CodexToolMode | null
   multi_agent_version: CodexMultiAgentVersion | null
   use_responses_lite: boolean
+  supports_reasoning_effort_updates?: boolean
   include_skills_usage_instructions: boolean
   auto_review_model_override: string | null
   context_window: number
@@ -25,7 +26,7 @@ export interface CodexModel {
   effective_context_window_percent?: number
   auto_compact_token_limit: number | null
   comp_hash: string | null
-  reasoning_summary_format: CodexReasoningSummaryFormat
+  reasoning_summary_format?: CodexReasoningSummaryFormat
   default_reasoning_summary: CodexReasoningSummary
   display_name: string
   description: string
@@ -47,15 +48,15 @@ export interface CodexModel {
   additional_speed_tiers: Array<string>
   supports_reasoning_summary_parameter: boolean
   supports_reasoning_summaries: boolean
-  base_instructions: string
+  base_instructions?: string
   [key: string]: unknown
 }
 
-export type CodexVerbosity = "low" | "medium"
+export type CodexVerbosity = "low" | "medium" | "high"
 
 export type CodexApplyPatchToolType = "freeform"
 
-export type CodexWebSearchToolType = "text_and_image"
+export type CodexWebSearchToolType = "text_and_image" | "text"
 
 export type CodexInputModality = "text" | "image"
 
@@ -87,7 +88,7 @@ export interface CodexReasoningLevel {
   description: string
 }
 
-export type CodexShellType = "shell_command"
+export type CodexShellType = "shell_command" | "unified_exec"
 
 export type CodexModelVisibility = "list" | "hide"
 
@@ -108,6 +109,7 @@ export type CodexModelPlan =
   | "education"
   | "enterprise"
   | "enterprise_cbp_automation"
+  | "enterprise_cbp_trial"
   | "enterprise_cbp_usage_based"
   | "finserv"
   | "free"
@@ -120,6 +122,7 @@ export type CodexModelPlan =
   | "prolite"
   | "quorum"
   | "sci"
+  | "self_serve_business_prolite"
   | "self_serve_business_usage_based"
   | "team"
 
@@ -131,7 +134,7 @@ export interface CodexServiceTier {
 
 export interface CodexModelMessages {
   instructions_template: string
-  instructions_variables: CodexInstructionsVariables | null
+  instructions_variables?: CodexInstructionsVariables | null
   approvals: unknown
   auto_review: unknown
   permissions: unknown

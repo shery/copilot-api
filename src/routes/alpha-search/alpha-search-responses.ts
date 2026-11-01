@@ -4,6 +4,7 @@ import consola from "consola"
 import {
   resolveEffectiveProviderType,
   resolveMappedModel,
+  resolveProviderConfigForModel,
   type ResolvedProviderConfig,
 } from "~/lib/config"
 import { HTTPError } from "~/lib/error"
@@ -644,7 +645,10 @@ async function resolveRemoteModel(
       )
     }
 
-    return { model, providerConfig }
+    return {
+      model,
+      providerConfig: resolveProviderConfigForModel(providerConfig, model),
+    }
   }
 
   const selectedModel =
@@ -698,7 +702,7 @@ async function requestProviderSearch(
     providerConfig,
     payload,
     c.req.raw.headers,
-    { signal: c.req.raw.signal },
+    { clientSignal: c.req.raw.signal },
   )
   if (!upstreamResponse.ok) {
     throw new HTTPError(
@@ -728,7 +732,7 @@ async function requestCopilotSearch(
   model: string,
   requestId: string,
   sessionId: string,
-  signal?: AbortSignal,
+  clientSignal?: AbortSignal,
 ): Promise<ResponsesResult> {
   debugJson(logger, "Alpha search Copilot Responses request:", payload)
   const result = (await alphaSearchResponsesDependencies.createResponses(
@@ -739,7 +743,7 @@ async function requestCopilotSearch(
       transport: "http",
       requestId,
       sessionId,
-      signal,
+      clientSignal,
     },
   )) as ResponsesResult
   debugJson(logger, "Alpha search Copilot Responses result:", result)

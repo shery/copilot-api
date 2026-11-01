@@ -7,7 +7,16 @@ import type { CompactType } from "~/lib/compact"
 import type { SubagentMarker } from "~/lib/subagent"
 import type { Model } from "~/lib/types/models"
 
+import { getRawProviderConfig } from "~/lib/config"
+import {
+  recordAnthropicFirstToken,
+  recordChatCompletionFirstToken,
+  recordResponsesFirstToken,
+} from "~/lib/first-token"
+import { GITHUB_COPILOT_PROVIDER } from "~/lib/github-copilot-provider"
 import { debugJson, debugJsonTail, debugLazy } from "~/lib/logger"
+import { getProviderModelPdfSupport } from "~/lib/model-pdf-support"
+import { writeSSEIfConnected } from "~/lib/sse"
 import { resolveBridgeToolSearchName } from "~/lib/tool-search"
 import {
   createCopilotTokenUsageRecorder,
@@ -58,13 +67,13 @@ import {
 import {
   translateToAnthropic,
   translateToOpenAI,
-} from "./non-stream-translation"
+} from "./completions-translation"
 import { prepareMessagesApiPayload } from "./preprocess"
 import {
   flushPendingAnthropicStreamEvents,
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
-} from "./stream-translation"
+} from "./completions-stream-translation"
 
 const COPILOT_CONTEXT_CACHE_SYSTEM_MARKER_LIMIT = 2
 const COPILOT_CONTEXT_CACHE_NON_SYSTEM_MARKER_LIMIT = 1
@@ -114,6 +123,14 @@ export const handleWithChatCompletions = async (
     compactType,
   } = options
   const openAIPayload = translateToOpenAI(anthropicPayload, {
+    supportPdf: getProviderModelPdfSupport(
+      anthropicPayload.model,
+      {
+        ...getRawProviderConfig(GITHUB_COPILOT_PROVIDER),
+        name: GITHUB_COPILOT_PROVIDER,
+      },
+      selectedModel,
+    ),
     validateReasoningEffort: true,
     reasoningEffortSupport:
       selectedModel?.capabilities.supports.reasoning_effort,
@@ -130,6 +147,7 @@ export const handleWithChatCompletions = async (
   const response = await messagesApiFlowDependencies.createChatCompletions(
     openAIPayload,
     {
+      clientSignal: c.req?.raw?.signal,
       subagentMarker,
       requestId,
       sessionId,
@@ -174,6 +192,7 @@ export const handleWithChatCompletions = async (
         }
 
         const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+        recordChatCompletionFirstToken(chunk)
         if (chunk.usage || chunk.copilot_usage) {
           usage = {
             ...normalizeOpenAIUsage(chunk.usage),
@@ -187,7 +206,7 @@ export const handleWithChatCompletions = async (
         for (const event of events) {
           const eventData = JSON.stringify(event)
           debugLazy(logger, () => ["Translated Anthropic event:", eventData])
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: event.type,
             data: eventData,
           })
@@ -200,7 +219,7 @@ export const handleWithChatCompletions = async (
     for (const event of flushPendingAnthropicStreamEvents(streamState)) {
       const eventData = JSON.stringify(event)
       debugLazy(logger, () => ["Translated Anthropic event:", eventData])
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: event.type,
         data: eventData,
       })
@@ -211,7 +230,7 @@ export const handleWithChatCompletions = async (
         "Chat completions stream ended without completion; sending error event",
       )
       const errorEvent = translateErrorToAnthropicErrorEvent()
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -228,10 +247,8 @@ export const handleWithResponsesApi = async (
 ) => {
   const { logger, selectedModel, ...requestOptions } = options
 
-  const responsesPayload = translateAnthropicMessagesToResponsesPayload(
-    anthropicPayload,
-    requestOptions.subagentMarker?.agent_id,
-  )
+  const responsesPayload =
+    translateAnthropicMessagesToResponsesPayload(anthropicPayload)
   const recordUsage = createCopilotUsageRecorder({
     endpoint: options.usageEndpoint ?? "responses",
     fallbackSessionId: requestOptions.sessionId,
@@ -263,7 +280,7 @@ export const handleWithResponsesApi = async (
     {
       vision,
       initiator,
-      signal: c.req?.raw?.signal,
+      clientSignal: c.req?.raw?.signal,
       transport,
       ...requestOptions,
     },
@@ -280,7 +297,10 @@ export const handleWithResponsesApi = async (
       for await (const chunk of response) {
         const eventName = chunk.event
         if (eventName === "ping") {
-          await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+          await writeSSEIfConnected(stream, {
+            event: "ping",
+            data: '{"type":"ping"}',
+          })
           continue
         }
 
@@ -292,6 +312,7 @@ export const handleWithResponsesApi = async (
         debugLazy(logger, () => ["Responses raw stream event:", data])
 
         const responseEvent = JSON.parse(data) as ResponseStreamEvent
+        recordResponsesFirstToken(responseEvent)
         if (
           responseEvent.type === "response.completed"
           || responseEvent.type === "response.failed"
@@ -309,7 +330,7 @@ export const handleWithResponsesApi = async (
         for (const event of events) {
           const eventData = JSON.stringify(event)
           debugLazy(logger, () => ["Translated Anthropic event:", eventData])
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: event.type,
             data: eventData,
           })
@@ -328,7 +349,7 @@ export const handleWithResponsesApi = async (
         const errorEvent = buildErrorEvent(
           "Responses stream ended without completion, retry your request.",
         )
-        await stream.writeSSE({
+        await writeSSEIfConnected(stream, {
           event: errorEvent.type,
           data: JSON.stringify(errorEvent),
         })
@@ -385,6 +406,8 @@ export const handleWithMessagesApi = async (
     anthropicPayload,
     anthropicBetaHeader,
     {
+      anthropicVersionHeader: c.req?.header("anthropic-version"),
+      clientSignal: c.req?.raw?.signal,
       subagentMarker,
       requestId,
       sessionId,
@@ -411,6 +434,7 @@ export const handleWithMessagesApi = async (
           }
           debugLazy(logger, () => ["Messages raw stream event:", data])
           const parsedEvent = parseAnthropicStreamEvent(data)
+          recordAnthropicFirstToken(parsedEvent)
           if (parsedEvent?.type === "message_start") {
             usage = mergeAnthropicUsage(usage, {
               ...normalizeAnthropicUsage(parsedEvent.message.usage),
@@ -430,7 +454,7 @@ export const handleWithMessagesApi = async (
           } else if (parsedEvent?.type === "error" || eventName === "error") {
             errorSeen = true
           }
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: eventName,
             data,
           })
@@ -444,7 +468,7 @@ export const handleWithMessagesApi = async (
           "Messages stream ended without completion; sending error event",
         )
         const errorEvent = translateErrorToAnthropicErrorEvent()
-        await stream.writeSSE({
+        await writeSSEIfConnected(stream, {
           event: errorEvent.type,
           data: JSON.stringify(errorEvent),
         })

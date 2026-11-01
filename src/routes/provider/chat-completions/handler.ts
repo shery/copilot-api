@@ -6,7 +6,7 @@ import { streamSSE } from "hono/streaming"
 import {
   type ModelConfig,
   type ResolvedProviderConfig,
-  resolveEffectiveProviderType,
+  resolveProviderConfigForModel,
 } from "~/lib/config"
 import {
   applyDashScopePreserveThinkingDefault,
@@ -14,8 +14,10 @@ import {
   isDashScopeAliyunProvider,
 } from "~/lib/dashscope"
 import { HTTPError } from "~/lib/error"
+import { recordChatCompletionFirstToken } from "~/lib/first-token"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
+import { writeSSEIfConnected } from "~/lib/sse"
 import {
   createProviderTokenUsageRecorder,
   normalizeOpenAIUsage,
@@ -45,12 +47,11 @@ export async function handleProviderChatCompletionsForProvider(
   },
 ): Promise<Response> {
   const { payload, provider } = options
-  const providerConfig = await resolveProviderConfig(provider)
-  if (
-    !providerConfig
-    || resolveEffectiveProviderType(providerConfig, payload.model)
-      !== "openai-compatible"
-  ) {
+  const configuredProvider = await resolveProviderConfig(provider)
+  const providerConfig =
+    configuredProvider
+    && resolveProviderConfigForModel(configuredProvider, payload.model)
+  if (!providerConfig || providerConfig.type !== "openai-compatible") {
     return c.json(
       {
         error: {
@@ -83,6 +84,7 @@ export async function handleProviderChatCompletionsForProvider(
     providerConfig,
     payload,
     c.req.raw.headers,
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -178,12 +180,13 @@ const streamProviderChatCompletions = (
         debugJson(logger, "provider.chat_completions.stream_chunk", chunk)
         if (chunk.data && chunk.data !== "[DONE]") {
           const parsedChunk = parseChatCompletionChunkData(chunk.data)
+          recordChatCompletionFirstToken(parsedChunk)
           if (parsedChunk?.usage) {
             usage = normalizeOpenAIUsage(parsedChunk.usage)
           }
         }
 
-        await stream.writeSSE({
+        await writeSSEIfConnected(stream, {
           event: chunk.event,
           data: chunk.data ?? "",
         })

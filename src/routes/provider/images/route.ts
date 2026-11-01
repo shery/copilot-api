@@ -1,25 +1,26 @@
 import { Hono, type Context } from "hono"
 
 import { forwardError } from "~/lib/error"
-import { createHandlerLogger, debugJson, debugJsonAsync } from "~/lib/logger"
+import { GITHUB_COPILOT_PROVIDER } from "~/lib/github-copilot-provider"
+import { prepareImageJsonRequest } from "~/lib/image-json-request"
+import { getDefaultImageModel } from "~/lib/image-models"
+import { createHandlerLogger } from "~/lib/logger"
+import { parseProviderModelAlias } from "~/lib/provider-model"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
-import { handleCodexImages } from "~/routes/images/route"
-import type { CodexImagesOperation } from "~/services/codex/images"
 import {
-  createProviderProxyResponse,
-  forwardProviderImages,
-} from "~/services/providers/provider-proxy"
+  forwardCopilotImagesWithLogging,
+  forwardProviderImagesWithLogging,
+} from "~/routes/images/forward-provider-images"
+import {
+  imageEditRequestErrorResponse,
+  withImageEditRequest,
+} from "~/routes/images/multipart-edits"
+import type { ParsedImagesRequest } from "~/routes/images/shared"
+import type { CodexImagesOperation } from "~/services/codex/images"
 
 const logger = createHandlerLogger("provider-images-handler")
 
 export const providerImageRoutes = new Hono()
-
-function getContentMetadata(headers: Headers) {
-  return {
-    contentType: headers.get("content-type"),
-    contentLength: headers.get("content-length"),
-  }
-}
 
 async function handleProviderImages(
   c: Context,
@@ -28,8 +29,11 @@ async function handleProviderImages(
   const provider = c.req.param("provider") ?? ""
 
   try {
-    const providerConfig = await resolveProviderConfig(provider)
-    if (!providerConfig) {
+    const providerConfig =
+      provider === GITHUB_COPILOT_PROVIDER ? null : (
+        await resolveProviderConfig(provider)
+      )
+    if (!providerConfig && provider !== GITHUB_COPILOT_PROVIDER) {
       return c.json(
         {
           error: {
@@ -41,40 +45,60 @@ async function handleProviderImages(
       )
     }
 
-    if (providerConfig.name === "codex") {
-      return await handleCodexImages(c, operation, providerConfig)
-    }
-
-    if (operation === "generations") {
-      await debugJsonAsync(
-        logger,
-        "provider.images.generations.request",
-        async () => ({
-          body: await c.req.raw.clone().text(),
-          provider,
-        }),
+    const forward = async (
+      request: Request,
+      model?: string,
+      multipartForm?: FormData,
+    ) => {
+      const context = { logger, provider, model, multipartForm }
+      if (!providerConfig) {
+        return await forwardCopilotImagesWithLogging(
+          request,
+          operation,
+          context,
+        )
+      }
+      return await forwardProviderImagesWithLogging(
+        providerConfig,
+        request,
+        operation,
+        context,
       )
-    } else {
-      debugJson(logger, "provider.images.edits.request", {
-        ...getContentMetadata(c.req.raw.headers),
-        provider,
-      })
     }
 
-    const upstreamResponse = await forwardProviderImages(
-      providerConfig,
-      c.req.raw,
-      operation,
-    )
+    const target = providerConfig?.name ?? provider
+    const defaultModel = getDefaultImageModel(target)
+    const isMultipartEdit =
+      operation === "edits"
+      && c.req.header("content-type")?.includes("multipart/form-data")
+    if (!defaultModel && !isMultipartEdit) return await forward(c.req.raw)
 
-    debugJson(logger, `provider.images.${operation}.response`, {
-      ...getContentMetadata(upstreamResponse.headers),
-      provider,
-      statusCode: upstreamResponse.status,
+    return await withImageEditRequest(c, operation, async (multipart) => {
+      if (!defaultModel) {
+        if (!multipart) return await forward(c.req.raw)
+        const request = await multipart.createRequest(undefined, target)
+        return await forward(request, multipart.model, multipart.formData)
+      }
+      const parsed: ParsedImagesRequest =
+        multipart ?? (await prepareImageJsonRequest(c.req.raw))
+      try {
+        const requested = parsed.model?.trim()
+        const alias = requested ? parseProviderModelAlias(requested) : null
+        const model =
+          (alias?.provider === target ? alias.model : requested) || defaultModel
+        const request =
+          parsed.model === model && parsed.originalRequest ?
+            parsed.originalRequest
+          : await parsed.createRequest(model, target)
+        return await forward(request, model, multipart?.formData)
+      } catch (error) {
+        await parsed.originalRequest?.body?.cancel().catch(() => {})
+        throw error
+      }
     })
-
-    return createProviderProxyResponse(upstreamResponse)
   } catch (error) {
+    const invalidRequest = imageEditRequestErrorResponse(c, error)
+    if (invalidRequest) return invalidRequest
     logger.error(`provider.images.${operation}.error`, { provider, error })
     return await forwardError(c, error)
   }

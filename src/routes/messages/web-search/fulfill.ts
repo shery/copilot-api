@@ -12,6 +12,7 @@ import {
   isResponsesApiWebSearchEnabled,
 } from "~/lib/config"
 import { findEndpointModel } from "~/lib/models"
+import { writeSSEIfConnected } from "~/lib/sse"
 import {
   parseProviderModelAlias,
   type ProviderModelAlias,
@@ -67,6 +68,7 @@ import { debugJson } from "~/lib/logger"
 
 export const webSearchFlowDependencies = {
   createResponses: createCopilotResponses,
+  getMessageApiWebSearchModel,
   resolveProviderConfig,
   createUsageRecorder: (
     payload: AnthropicMessagesPayload,
@@ -230,7 +232,6 @@ export const prepareWebSearchResponsesPayload = (
   payload: AnthropicMessagesPayload,
   options: {
     model?: string
-    subagentAgentId?: string | null
   } = {},
 ): ResponsesPayload => {
   const config = extractWebSearchConfig(payload)
@@ -241,10 +242,8 @@ export const prepareWebSearchResponsesPayload = (
     stream: true,
   }
 
-  const responsesPayload = translateAnthropicMessagesToResponsesPayload(
-    switchedPayload,
-    options.subagentAgentId,
-  )
+  const responsesPayload =
+    translateAnthropicMessagesToResponsesPayload(switchedPayload)
   responsesPayload.tools = [
     buildResponsesWebSearchTool({ ...config, searchContextSize: "low" }),
   ]
@@ -335,7 +334,7 @@ export const tryHandleWebSearch = async (
   normalizeSystemMessages(payload)
 
   const route = await resolveWebSearchRoute(payload, {
-    webSearchModel: getMessageApiWebSearchModel(),
+    webSearchModel: webSearchFlowDependencies.getMessageApiWebSearchModel(),
     responsesWebSearchEnabled: isResponsesApiWebSearchEnabled(),
     resolveProviderConfig: webSearchFlowDependencies.resolveProviderConfig,
   })
@@ -385,7 +384,6 @@ export const handleWebSearchViaResponses = async (
   // Responses web_search tool is attached to the translated payload instead.
   const responsesPayload = prepareWebSearchResponsesPayload(payload, {
     model: webSearchModel,
-    subagentAgentId: options.subagentMarker?.agent_id,
   })
 
   const selectedModel: Model | undefined = findEndpointModel(webSearchModel)
@@ -410,7 +408,7 @@ export const handleWebSearchViaResponses = async (
       subagentMarker: options.subagentMarker,
       requestId: options.requestId,
       sessionId: options.sessionId,
-      signal: c.req?.raw?.signal,
+      clientSignal: c.req?.raw?.signal,
       compactType: options.compactType,
     },
   )
@@ -454,7 +452,7 @@ export const handleWebSearchViaResponses = async (
     for (const event of buildSyntheticStreamEvents(response)) {
       const data = JSON.stringify(event)
       logger.debug(`Web search stream event`, data)
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: event.type,
         data: data,
       })

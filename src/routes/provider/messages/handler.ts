@@ -24,10 +24,10 @@ import {
   type ModelConfig,
   type ResolvedProviderConfig,
   getClaudeAutoModel,
-  resolveEffectiveProviderType,
-  resolveProviderAuthType,
+  resolveProviderConfigForModel,
 } from "~/lib/config"
-import { builtinProviderModelRegistry } from "~/lib/builtin-provider-models"
+import { getProviderModelConfig } from "~/lib/provider-model-catalog"
+import { fromClaudeDiscoveryModelId } from "~/lib/claude-models"
 import { logCodexRateLimitsEvent } from "~/lib/codex-rate-limit"
 import {
   applyDashScopePreserveThinkingDefault,
@@ -35,8 +35,15 @@ import {
   isDashScopeAliyunProvider,
 } from "~/lib/dashscope"
 import { HTTPError } from "~/lib/error"
+import {
+  recordAnthropicFirstToken,
+  recordChatCompletionFirstToken,
+  recordResponsesFirstToken,
+} from "~/lib/first-token"
 import { createHandlerLogger, debugJson, debugLazy } from "~/lib/logger"
+import { getProviderModelPdfSupport } from "~/lib/model-pdf-support"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
+import { writeSSEIfConnected } from "~/lib/sse"
 import { resolveBridgeToolSearchName } from "~/lib/tool-search"
 import {
   createProviderTokenUsageRecorder,
@@ -48,15 +55,16 @@ import {
   type UsageTokens,
 } from "~/lib/token-usage"
 import { isResponsesStream, parseUserIdMetadata } from "~/lib/utils"
+import { setPluginRequestModel } from "~/lib/request-events"
 import {
   translateToAnthropic,
   translateToOpenAI,
-} from "~/routes/messages/non-stream-translation"
+} from "~/routes/messages/completions-translation"
 import {
   flushPendingAnthropicStreamEvents,
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
-} from "~/routes/messages/stream-translation"
+} from "~/routes/messages/completions-stream-translation"
 import {
   buildErrorEvent,
   createResponsesStreamState,
@@ -76,6 +84,8 @@ import {
   stripWebSearchServerTool,
 } from "~/routes/messages/web-search/fulfill"
 import {
+  appendClaudeContinuationMessage,
+  applyClaudeNoToolsEffort,
   isClaudeAutoModelRequest,
   normalizeSystemMessages,
 } from "~/routes/messages/preprocess"
@@ -98,6 +108,7 @@ import {
   normalizeProviderResponsesReasoningEffort,
 } from "~/routes/provider/utils"
 import consola from "consola"
+import { handleGoogleProviderMessages } from "./google-handler"
 
 const logger = createHandlerLogger("provider-messages-handler")
 
@@ -110,6 +121,9 @@ export async function handleProviderMessages(
 ): Promise<Response> {
   const provider = c.req.param("provider")
   const payload = await c.req.json<AnthropicMessagesPayload>()
+  setPluginRequestModel(payload.model)
+  payload.model = fromClaudeDiscoveryModelId(payload.model)
+  applyClaudeNoToolsEffort(payload, c.req.header("user-agent"))
 
   const claudeAutoModel = getClaudeAutoModel()
   if (claudeAutoModel && isClaudeAutoModelRequest(payload)) {
@@ -134,9 +148,9 @@ export async function handleProviderMessagesForProvider(
   },
 ): Promise<Response> {
   const { payload, provider, usageEndpoint } = options
-  const providerConfig =
+  const configuredProvider =
     await providerMessagesHandlerDependencies.resolveProviderConfig(provider)
-  if (!providerConfig) {
+  if (!configuredProvider) {
     return c.json(
       {
         error: {
@@ -149,16 +163,28 @@ export async function handleProviderMessagesForProvider(
   }
 
   try {
-    const modelConfig = providerConfig.models?.[payload.model]
-    const effectiveType = resolveEffectiveProviderType(
-      providerConfig,
+    const providerConfig = resolveProviderConfigForModel(
+      configuredProvider,
       payload.model,
     )
+    const modelConfig = providerConfig.models?.[payload.model]
+    const effectiveType = providerConfig.type
     debugJson(logger, "provider.messages.request", { payload, provider })
 
     normalizeSystemMessages(payload)
 
     applyModelDefaults(payload, modelConfig)
+    appendClaudeContinuationMessage(payload)
+
+    if (effectiveType === "google") {
+      stripWebSearchServerTool(payload)
+      return await handleGoogleProviderMessages(
+        c,
+        payload,
+        providerConfig,
+        usageEndpoint,
+      )
+    }
 
     if (effectiveType === "openai-responses") {
       if (hasWebSearchServerTool(payload)) {
@@ -205,19 +231,10 @@ export async function handleProviderMessagesForProvider(
       provider,
     })
     const upstreamResponse = await forwardProviderMessages(
-      effectiveType === providerConfig.type ?
-        providerConfig
-      : {
-          ...providerConfig,
-          type: effectiveType,
-          authType: resolveProviderAuthType(
-            providerConfig.name,
-            undefined,
-            effectiveType,
-          ),
-        },
+      providerConfig,
       payload,
       c.req.raw.headers,
+      { clientSignal: c.req.raw.signal },
     )
 
     if (!upstreamResponse.ok) {
@@ -292,7 +309,7 @@ const handleOpenAIResponsesProviderWebSearchMessages = async (
       responsesPayload,
       c.req.raw.headers,
       providerConfig.baseUrl,
-      { signal: c.req.raw.signal },
+      { clientSignal: c.req.raw.signal },
     )
 
     if (isResponsesStream(upstreamResponse)) {
@@ -327,7 +344,7 @@ const handleOpenAIResponsesProviderWebSearchMessages = async (
     providerConfig,
     responsesPayload,
     c.req.raw.headers,
-    { signal: c.req.raw.signal },
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -347,10 +364,7 @@ const handleOpenAIResponsesProviderWebSearchMessages = async (
       errorMessagePrefix: `${provider} web search responses stream`,
       parseEvent: (data) =>
         parseResponsesProviderStreamChunk(data, providerConfig),
-      upstreamResponse: createResponsesHttpEventStream(
-        upstreamResponse,
-        c.req.raw.signal,
-      ),
+      upstreamResponse: createResponsesHttpEventStream(upstreamResponse),
       logger,
     })
     return respondWebSearchProviderMessagesJson(c, {
@@ -425,7 +439,7 @@ const handleOpenAIResponsesProviderMessages = async (
       responsesPayload,
       c.req.raw.headers,
       providerConfig.baseUrl,
-      { signal: c.req.raw.signal },
+      { clientSignal: c.req.raw.signal },
     )
 
     if (isResponsesStream(upstreamResponse)) {
@@ -475,7 +489,7 @@ const handleOpenAIResponsesProviderMessages = async (
     providerConfig,
     responsesPayload,
     c.req.raw.headers,
-    { signal: c.req.raw.signal },
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -492,8 +506,7 @@ const handleOpenAIResponsesProviderMessages = async (
       provider,
       providerConfig,
       upstreamResponse: createResponsesSafeStream(
-        createResponsesHttpEventStream(upstreamResponse, c.req.raw.signal),
-        { signal: c.req.raw.signal },
+        createResponsesHttpEventStream(upstreamResponse),
       ),
       usageEndpoint,
     })
@@ -575,6 +588,7 @@ const handleOpenAICompatibleProviderMessages = async (
     providerConfig,
     openAIPayload,
     c.req.raw.headers,
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -621,7 +635,7 @@ const createOpenAICompatiblePayload = (
   providerConfig: ResolvedProviderConfig,
 ): ChatCompletionsPayload => {
   const openAIPayload = translateToOpenAI(payload, {
-    supportPdf: modelConfig?.supportPdf,
+    supportPdf: getProviderModelPdfSupport(payload.model, providerConfig),
     toolContentSupportType: modelConfig?.toolContentSupportType ?? [],
   })
 
@@ -661,6 +675,8 @@ const createOpenAICompatiblePayload = (
     extraBody: modelConfig?.extraBody,
   })
 
+  applyMiMoThinking(openAIPayload, payload)
+
   applyDashScopePreserveThinkingDefault(
     openAIPayload as unknown as Record<string, unknown>,
     providerConfig,
@@ -678,6 +694,31 @@ const createOpenAICompatiblePayload = (
   return openAIPayload
 }
 
+const applyMiMoThinking = (
+  payload: ChatCompletionsPayload,
+  source: AnthropicMessagesPayload,
+): void => {
+  if (!/(?:^|\/)mimo(?:[-_.]|$)/i.test(payload.model)) {
+    return
+  }
+
+  const sourceThinkingType = source.thinking?.type
+  const shouldEnableThinking = Boolean(
+    payload.reasoning_effort || sourceThinkingType,
+  )
+  delete payload.reasoning_effort
+
+  if (sourceThinkingType === "disabled") {
+    payload.thinking = { type: "disabled" }
+    delete payload.thinking_budget
+    return
+  }
+
+  if (shouldEnableThinking) {
+    payload.thinking = { type: "enabled" }
+  }
+}
+
 const normalizeOpenAICompatibleReasoningContent = (
   payload: ChatCompletionsPayload,
   options: {
@@ -690,9 +731,10 @@ const normalizeOpenAICompatibleReasoningContent = (
   // history messages instead of the default "reasoning_content" field
   const reasoningField =
     options.modelConfig?.reasoningField
-    ?? builtinProviderModelRegistry.getModelConfig(
+    ?? getProviderModelConfig(
       options.providerConfig.name,
       payload.model,
+      options.providerConfig,
     )?.reasoningField
     ?? "reasoning_content"
 
@@ -778,7 +820,10 @@ const streamProviderMessages = ({
         logger.debug("provider.messages.raw_stream_event:", chunk.data)
         const eventName = chunk.event
         if (eventName === "ping") {
-          await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+          await writeSSEIfConnected(stream, {
+            event: "ping",
+            data: '{"type":"ping"}',
+          })
           continue
         }
 
@@ -811,7 +856,7 @@ const streamProviderMessages = ({
             )
           : [{ data, event: eventName }]
         for (const streamEvent of streamEvents) {
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: streamEvent.event,
             data: streamEvent.data,
           })
@@ -824,7 +869,7 @@ const streamProviderMessages = ({
     if (!messageStopSeen && !errorSeen) {
       logger.warn("provider.messages.stream_incomplete:", { provider })
       const errorEvent = translateErrorToAnthropicErrorEvent()
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -878,7 +923,10 @@ const streamOpenAICompatibleProviderMessages = ({
         )
         const eventName = chunk.event
         if (eventName === "ping") {
-          await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+          await writeSSEIfConnected(stream, {
+            event: "ping",
+            data: '{"type":"ping"}',
+          })
           continue
         }
 
@@ -890,6 +938,7 @@ const streamOpenAICompatibleProviderMessages = ({
         }
 
         const parsed = parseOpenAICompatibleStreamChunk(chunk.data)
+        recordChatCompletionFirstToken(parsed)
         if (!parsed) {
           continue
         }
@@ -905,7 +954,7 @@ const streamOpenAICompatibleProviderMessages = ({
             "provider.messages.openai_compatible.translated_event:",
             eventData,
           ])
-          await stream.writeSSE({
+          await writeSSEIfConnected(stream, {
             event: event.type,
             data: eventData,
           })
@@ -924,7 +973,7 @@ const streamOpenAICompatibleProviderMessages = ({
         "provider.messages.openai_compatible.translated_event:",
         eventData,
       ])
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: event.type,
         data: eventData,
       })
@@ -935,7 +984,7 @@ const streamOpenAICompatibleProviderMessages = ({
         provider,
       })
       const errorEvent = translateErrorToAnthropicErrorEvent()
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -984,7 +1033,10 @@ const streamResponsesProviderMessages = ({
       logger.debug("provider.messages.responses.raw_stream_event:", chunk.data)
       const eventName = chunk.event
       if (eventName === "ping") {
-        await stream.writeSSE({ event: "ping", data: '{"type":"ping"}' })
+        await writeSSEIfConnected(stream, {
+          event: "ping",
+          data: '{"type":"ping"}',
+        })
         continue
       }
 
@@ -999,6 +1051,7 @@ const streamResponsesProviderMessages = ({
         chunk.data,
         providerConfig,
       )
+      recordResponsesFirstToken(parsed)
       if (!parsed) {
         continue
       }
@@ -1018,7 +1071,7 @@ const streamResponsesProviderMessages = ({
           "provider.messages.responses.translated_event:",
           eventData,
         ])
-        await stream.writeSSE({
+        await writeSSEIfConnected(stream, {
           event: event.type,
           data: eventData,
         })
@@ -1029,7 +1082,7 @@ const streamResponsesProviderMessages = ({
       const errorEvent = buildErrorEvent(
         `${provider} stream ended without a completion event, retry your request.`,
       )
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: errorEvent.type,
         data: JSON.stringify(errorEvent),
       })
@@ -1084,6 +1137,7 @@ const parseProviderStreamEvent = (
 } | null => {
   try {
     const parsed = JSON.parse(data) as AnthropicStreamEventData
+    recordAnthropicFirstToken(parsed)
     if (parsed.type === "message_start") {
       return {
         data: JSON.stringify(parsed),
@@ -1350,7 +1404,7 @@ const respondWebSearchProviderMessagesJson = (
     for (const event of buildSyntheticStreamEvents(response)) {
       const data = JSON.stringify(event)
       logger.debug(`Web search stream event`, data)
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         event: event.type,
         data: data,
       })

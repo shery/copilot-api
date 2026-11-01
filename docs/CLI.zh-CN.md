@@ -110,11 +110,18 @@ export ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY
 
 ### Claude Code
 
-```sh
-bun run start start --claude-code
+在 `.claude/settings.json` 中填入网关地址和普通 key（`--claude-code` 参数已被移除）：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:4141",
+    "ANTHROPIC_AUTH_TOKEN": "<config.json 中的 auth.apiKeys[0]>"
+  }
+}
 ```
 
-该命令会根据可用模型生成 Claude Code 环境变量命令，并复制到剪贴板。剪贴板内容包含本地 API Key，不要粘贴到聊天、Issue 或日志中。
+模型映射和其余环境变量见 [Claude Code 指南](./guides/zh-CN/claude-code.md)。该文件包含本地 API Key，不要粘贴到聊天、Issue 或日志中。
 
 ## 6. 常用启动选项
 
@@ -150,16 +157,17 @@ bun run start start --host 0.0.0.0
 3. 公网访问放在 HTTPS 反向代理后。
 4. 不暴露 `config.json`、凭据目录和日志目录。
 
-Docker 仅本机映射：
+Docker 仅本机映射：使用仓库自带的 Compose 文件，它在未设置 `COPILOT_API_BIND` 时只把端口发布到 `127.0.0.1`，把状态存在挂载到 `/data` 的 `./copilot-data`，并以非 root 的 `bun` 用户运行服务：
 
 ```sh
-docker run \
-  -p 127.0.0.1:4141:4141 \
-  -v "$(pwd)/copilot-data:/root/.local/share/copilot-api" \
-  copilot-api
+mkdir -p copilot-data
+docker compose pull
+docker compose run --rm copilot-api --auth keys --add YOUR_GATEWAY_API_KEY
+docker compose run --rm copilot-api --auth login
+docker compose up -d
 ```
 
-镜像 entrypoint 会让容器内服务监听所有接口；宿主机仍通过 `127.0.0.1:4141:4141` 限制访问。
+容器内 entrypoint 默认把 `HOST` 设为 `0.0.0.0`，实际限制访问的是宿主机侧的 `127.0.0.1:4141:4141` 映射。环境变量和数据目录权限修复见 [Docker 指南](./guides/zh-CN/docker.md)。
 
 ## 8. 用量与诊断
 

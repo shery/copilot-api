@@ -8,6 +8,7 @@ import {
 } from "bun:test"
 import { Hono } from "hono"
 
+import { installModelsDevCatalog } from "~/lib/models-dev-cache"
 import { requestContext } from "~/lib/request-context"
 import { state } from "~/lib/state"
 import {
@@ -17,15 +18,29 @@ import {
   recordTokenUsageEvent,
   type TokenUsageDailySummary,
   type TokenUsageEventsPage,
+  type TokenUsagePeriod,
+  type TokenUsageSessionsPage,
   type TokenUsageSummary,
 } from "~/lib/token-usage"
-import { resolveTokenUsageCost } from "~/lib/token-usage/pricing"
+import {
+  isPeakPricingTime,
+  resolveTokenUsageCost,
+  type TokenUsageCostInput,
+} from "~/lib/token-usage/pricing"
 import { traceIdMiddleware } from "~/lib/trace"
 import { tokenUsageRoute } from "~/routes/token-usage/route"
+import { translateToOpenAI } from "~/routes/messages/completions-translation"
+import { parseUserIdMetadata } from "~/lib/utils"
+
+import {
+  modelsDevCatalogFixture,
+  modelsDevProviderCatalogFixture,
+} from "./fixtures/models-dev-catalog"
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 
 beforeEach(async () => {
+  installModelsDevCatalog(modelsDevProviderCatalogFixture)
   process.env[DB_PATH_ENV] = ":memory:"
   state.userName = "copilot-login"
   await closeUsageStore()
@@ -47,14 +62,20 @@ function createTokenUsageApp(): Hono {
 
 async function fetchEventsPage(pageSize = 20): Promise<TokenUsageEventsPage> {
   const response = await createTokenUsageApp().request(
-    `/token-usage/events?period=day&page=1&page_size=${pageSize}`,
+    `/token-usage/events?period=today&page=1&page_size=${pageSize}`,
   )
   expect(response.status).toBe(200)
   return (await response.json()) as TokenUsageEventsPage
 }
 
-function localDate(year: number, month: number, day: number, hour = 12): Date {
-  return new Date(year, month, day, hour, 0, 0, 0)
+function localDate(
+  year: number,
+  month: number,
+  day: number,
+  hour = 12,
+  minute = 0,
+): Date {
+  return new Date(year, month, day, hour, minute, 0, 0)
 }
 
 function localDateLabel(date: Date): string {
@@ -64,7 +85,114 @@ function localDateLabel(date: Date): string {
   return `${year}-${month}-${day}`
 }
 
+// Different UTC times verify cached prices do not use the former peak overrides.
+const deepseekPeakTime = new Date("2026-09-14T02:00:00.000Z")
+const deepseekOffPeakTime = new Date("2026-09-19T02:00:00.000Z")
+const dashscopePeakTime = new Date("2026-09-14T00:30:00.000Z")
+const dashscopeOffPeakTime = new Date("2026-09-14T15:00:00.000Z")
+
+function buildPricedUsage(
+  model: string,
+  providerName: string,
+): TokenUsageCostInput {
+  return {
+    cache_read_input_tokens: 2_000,
+    input_tokens: 1_000,
+    model,
+    output_tokens: 3_000,
+    providerName,
+    source: "provider",
+  }
+}
+
 describe("token usage storage", () => {
+  test.each(["copilot", "provider"] as const)(
+    "keeps sibling usage session ids separate with a shared cache key for %s",
+    async (source) => {
+      for (const sessionId of ["child-a", "child-b"]) {
+        requestContext.run(
+          {
+            traceId: `trace-${sessionId}`,
+            startTime: Date.now(),
+            userAgent: "test",
+            rootSessionId: "root",
+            parentSessionId: "root",
+            sessionAffinity: sessionId,
+          },
+          () => {
+            const payload = {
+              model: "gpt-test",
+              max_tokens: 128,
+              messages: [],
+              metadata: {
+                user_id: JSON.stringify({
+                  session_id: `metadata-${sessionId}`,
+                }),
+              },
+            }
+            expect(translateToOpenAI(payload).prompt_cache_key).toBe("root")
+            recordTokenUsageEvent({
+              source,
+              endpoint: "messages",
+              model: payload.model,
+              input_tokens: 10,
+              sessionId: parseUserIdMetadata(payload.metadata.user_id)
+                .sessionId,
+              fallbackSessionId: "interaction-session",
+              providerName: source === "provider" ? "test-provider" : undefined,
+            })
+          },
+        )
+      }
+
+      const page = await fetchEventsPage()
+      expect(page.items.map((row) => row.session_id).sort()).toEqual([
+        "child-a",
+        "child-b",
+      ])
+    },
+  )
+
+  test.each(["metadata", "fallback"] as const)(
+    "keeps %s usage session ids when only a root cache session exists",
+    async (mode) => {
+      requestContext.run(
+        {
+          traceId: "trace-child",
+          startTime: Date.now(),
+          userAgent: "test",
+          rootSessionId: "root",
+          parentSessionId: "root",
+          sessionAffinity: undefined,
+        },
+        () => {
+          const payload = {
+            model: "gpt-test",
+            max_tokens: 128,
+            messages: [],
+            metadata:
+              mode === "metadata" ?
+                { user_id: JSON.stringify({ session_id: "metadata-child" }) }
+              : undefined,
+          }
+          expect(translateToOpenAI(payload).prompt_cache_key).toBe("root")
+          recordTokenUsageEvent({
+            source: "copilot",
+            endpoint: "messages",
+            model: payload.model,
+            input_tokens: 10,
+            sessionId: parseUserIdMetadata(payload.metadata?.user_id).sessionId,
+            fallbackSessionId: "fallback-child",
+          })
+        },
+      )
+
+      const page = await fetchEventsPage()
+      expect(page.items).toHaveLength(1)
+      expect(page.items[0]?.session_id).toBe(`${mode}-child`)
+    },
+  )
+
   test("normalizes OpenAI cache creation usage details", () => {
     expect(
       normalizeOpenAIUsage({
@@ -144,7 +272,7 @@ describe("token usage storage", () => {
     })
 
     const response = await createTokenUsageApp().request(
-      "/token-usage?period=day",
+      "/token-usage?period=today",
     )
     expect(response.status).toBe(200)
     const summary = (await response.json()) as TokenUsageSummary
@@ -173,7 +301,7 @@ describe("token usage storage", () => {
     })
 
     const response = await createTokenUsageApp().request(
-      "/token-usage?period=day",
+      "/token-usage?period=today",
     )
     expect(response.status).toBe(200)
 
@@ -224,7 +352,7 @@ describe("token usage storage", () => {
     })
 
     const response = await createTokenUsageApp().request(
-      "/token-usage/events?period=day&page=1&page_size=1",
+      "/token-usage/events?period=today&page=1&page_size=1",
     )
     expect(response.status).toBe(200)
 
@@ -273,7 +401,7 @@ describe("token usage storage", () => {
     }
 
     const response = await createTokenUsageApp().request(
-      "/token-usage?period=day",
+      "/token-usage?period=today",
     )
     expect(response.status).toBe(200)
     const summary = (await response.json()) as TokenUsageSummary
@@ -358,22 +486,29 @@ describe("token usage storage", () => {
     }
   })
 
-  test("prices OpenCode Go Hy3 and GPT-5.6 Luna with long-context tiers", () => {
-    const shortContextCosts = [
-      { model: "hy3", totalCostNanos: 1_950_000 },
-      { model: "gpt-5.6-luna", totalCostNanos: 2_045_000 },
-      { model: "qwen3.8-max", totalCostNanos: 23_000_000 },
+  test("prices GPT-6.1 Sol cache usage at the 272K input tier boundary", () => {
+    const expectedCosts = [
+      {
+        cache_creation_input_tokens: 1_000,
+        cache_read_input_tokens: 2_000,
+        input_tokens: 269_000,
+        totalCostNanos: 570_700_000,
+      },
+      {
+        cache_creation_input_tokens: 1_000,
+        cache_read_input_tokens: 2_000,
+        input_tokens: 269_001,
+        totalCostNanos: 1_126_404_000,
+      },
     ]
 
-    for (const { model, totalCostNanos } of shortContextCosts) {
+    for (const { totalCostNanos, ...usage } of expectedCosts) {
       expect(
         resolveTokenUsageCost({
-          cache_creation_input_tokens: 1_000,
-          cache_read_input_tokens: 2_000,
-          input_tokens: 1_000,
-          model,
+          ...usage,
+          model: "gpt-6.1-sol",
           output_tokens: 3_000,
-          providerName: "opencode-go",
+          providerName: "codex",
           source: "provider",
         }),
       ).toEqual({
@@ -382,25 +517,32 @@ describe("token usage storage", () => {
         total_cost_nanos: totalCostNanos,
       })
     }
-
-    expect(
-      resolveTokenUsageCost({
-        cache_creation_input_tokens: 2_000,
-        cache_read_input_tokens: 2_000,
-        input_tokens: 269_000,
-        model: "gpt-5.6-luna",
-        output_tokens: 3_000,
-        providerName: "opencode-go",
-        source: "provider",
-      }),
-    ).toEqual({
-      currency: "USD",
-      source: "builtin",
-      total_cost_nanos: 57_040_000,
-    })
   })
 
-  test("prices DashScope Qwen3.8 Max with explicit cache prices", () => {
+  test("prices GPT-6.1 Terra cache usage at the 272K input tier boundary", () => {
+    for (const { inputTokens, totalCostNanos } of [
+      { inputTokens: 269_000, totalCostNanos: 285_350_000 },
+      { inputTokens: 269_001, totalCostNanos: 563_202_000 },
+    ]) {
+      expect(
+        resolveTokenUsageCost({
+          cache_creation_input_tokens: 1_000,
+          cache_read_input_tokens: 2_000,
+          input_tokens: inputTokens,
+          model: "gpt-6.1-terra",
+          output_tokens: 3_000,
+          providerName: "codex",
+          source: "provider",
+        }),
+      ).toEqual({
+        currency: "USD",
+        source: "builtin",
+        total_cost_nanos: totalCostNanos,
+      })
+    }
+  })
+
+  test("prices DashScope Qwen3.8 Max from the cached USD catalog", () => {
     expect(
       resolveTokenUsageCost({
         cache_creation_input_tokens: 1_000,
@@ -412,78 +554,185 @@ describe("token usage storage", () => {
         source: "provider",
       }),
     ).toEqual({
-      currency: "CNY",
-      source: "builtin",
-      total_cost_nanos: 137_000_000,
+      currency: "USD",
+      source: "models.dev",
+      total_cost_nanos: 20_500_000,
     })
   })
 
-  test("prices DashScope DeepSeek V4 Flash 0731 with cached input", () => {
+  test("prices DashScope DeepSeek from the catalog without static peak overrides", () => {
+    const usage = buildPricedUsage("deepseek-v4.1-flash", "dashscope")
+
+    expect(resolveTokenUsageCost({ ...usage, at: dashscopePeakTime })).toEqual({
+      currency: "USD",
+      source: "models.dev",
+      total_cost_nanos: 1_956_000,
+    })
     expect(
-      resolveTokenUsageCost({
-        cache_read_input_tokens: 2_000,
-        input_tokens: 1_000,
-        model: "deepseek-v4-flash-0731",
-        output_tokens: 3_000,
-        providerName: "dashscope",
-        source: "provider",
-      }),
+      resolveTokenUsageCost({ ...usage, at: dashscopeOffPeakTime }),
     ).toEqual({
-      currency: "CNY",
-      source: "builtin",
-      total_cost_nanos: 7_400_000,
+      currency: "USD",
+      source: "models.dev",
+      total_cost_nanos: 1_956_000,
     })
   })
 
-  test("prices DeepSeek models with peak-tier prices in CNY", () => {
+  test("prices DeepSeek models from models.dev in USD without static peak overrides", () => {
     const expectedCosts = [
-      { model: "deepseek-v4-flash", totalCostNanos: 30_200_000 },
-      { model: "deepseek-v4-pro", totalCostNanos: 90_600_000 },
+      {
+        model: "deepseek-flash",
+        offPeakCostNanos: 1_956_000,
+        peakCostNanos: 1_956_000,
+      },
+      {
+        model: "deepseek-v4-pro",
+        offPeakCostNanos: 6_644_000,
+        peakCostNanos: 6_644_000,
+      },
     ]
 
-    for (const { model, totalCostNanos } of expectedCosts) {
+    for (const expected of expectedCosts) {
+      const usage = buildPricedUsage(expected.model, "deepseek")
+
+      expect(resolveTokenUsageCost({ ...usage, at: deepseekPeakTime })).toEqual(
+        {
+          currency: "USD",
+          source: "models.dev",
+          total_cost_nanos: expected.peakCostNanos,
+        },
+      )
       expect(
-        resolveTokenUsageCost({
-          cache_read_input_tokens: 2_000,
-          input_tokens: 1_000,
-          model,
-          output_tokens: 3_000,
-          providerName: "deepseek",
-          source: "provider",
-        }),
+        resolveTokenUsageCost({ ...usage, at: deepseekOffPeakTime }),
       ).toEqual({
-        currency: "CNY",
-        source: "builtin",
-        total_cost_nanos: totalCostNanos,
+        currency: "USD",
+        source: "models.dev",
+        total_cost_nanos: expected.offPeakCostNanos,
       })
     }
   })
 
-  test("prices OpenCode Go DeepSeek models with catalog prices in USD", () => {
+  test("prices OpenCode Go models from the models.dev catalog in USD", () => {
+    installModelsDevCatalog(modelsDevCatalogFixture)
     const expectedCosts = [
-      { model: "deepseek-v4-flash", totalCostNanos: 2_214_000 },
-      { model: "deepseek-v4-pro", totalCostNanos: 6_644_000 },
+      {
+        model: "deepseek-v4.1-flash",
+        offPeakCostNanos: 1_956_000,
+        peakCostNanos: 1_956_000,
+      },
+      {
+        model: "deepseek-v4-pro",
+        offPeakCostNanos: 6_644_000,
+        peakCostNanos: 6_644_000,
+      },
     ]
 
-    for (const { model, totalCostNanos } of expectedCosts) {
+    for (const expected of expectedCosts) {
+      const usage = buildPricedUsage(expected.model, "opencode-go")
+
+      expect(resolveTokenUsageCost({ ...usage, at: deepseekPeakTime })).toEqual(
+        {
+          currency: "USD",
+          source: "builtin",
+          total_cost_nanos: expected.peakCostNanos,
+        },
+      )
       expect(
-        resolveTokenUsageCost({
-          cache_read_input_tokens: 2_000,
-          input_tokens: 1_000,
-          model,
-          output_tokens: 3_000,
-          providerName: "opencode-go",
-          source: "provider",
-        }),
+        resolveTokenUsageCost({ ...usage, at: deepseekOffPeakTime }),
       ).toEqual({
         currency: "USD",
         source: "builtin",
-        total_cost_nanos: totalCostNanos,
+        total_cost_nanos: expected.offPeakCostNanos,
       })
     }
   })
 
-  test("prices Kimi models in USD and DashScope Kimi in CNY", () => {
+  test("supports configured weekday and daily peak windows in UTC", () => {
+    const weekdayWindows = [
+      { startMinuteUtc: 60, endMinuteUtc: 240, weekdays: [1, 2, 3, 4, 5] },
+    ]
+    const dailyWindows = [{ startMinuteUtc: 0, endMinuteUtc: 840 }]
+    expect(
+      isPeakPricingTime(weekdayWindows, new Date("2026-09-18T00:59:00Z")),
+    ).toBe(false)
+    expect(
+      isPeakPricingTime(weekdayWindows, new Date("2026-09-18T01:00:00Z")),
+    ).toBe(true)
+    expect(
+      isPeakPricingTime(weekdayWindows, new Date("2026-09-18T03:59:00Z")),
+    ).toBe(true)
+    expect(
+      isPeakPricingTime(weekdayWindows, new Date("2026-09-18T04:00:00Z")),
+    ).toBe(false)
+    expect(
+      isPeakPricingTime(weekdayWindows, new Date("2026-09-19T02:00:00Z")),
+    ).toBe(false)
+    expect(
+      isPeakPricingTime(dailyWindows, new Date("2026-09-19T13:59:00Z")),
+    ).toBe(true)
+    expect(
+      isPeakPricingTime(dailyWindows, new Date("2026-09-19T14:00:00Z")),
+    ).toBe(false)
+  })
+
+  test("ignores off-peak prices when no peak window is configured", () => {
+    expect(
+      resolveTokenUsageCost({
+        at: deepseekOffPeakTime,
+        input_tokens: 1_000,
+        model: "custom-model",
+        output_tokens: 1_000,
+        pricing: {
+          input: 1,
+          offPeak: {
+            input: 0.1,
+            output: 0.2,
+          },
+          output: 2,
+        },
+        pricingCurrency: "USD",
+        providerName: "anthropic",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "USD",
+      source: "config",
+      total_cost_nanos: 3_000_000,
+    })
+  })
+
+  test("records DeepSeek costs from the cached models.dev catalog", async () => {
+    setSystemTime(deepseekOffPeakTime)
+    recordTokenUsageEvent({
+      cache_read_input_tokens: 2_000,
+      endpoint: "provider_messages",
+      input_tokens: 1_000,
+      model: "deepseek-flash",
+      output_tokens: 3_000,
+      providerName: "deepseek",
+      source: "provider",
+    })
+
+    const page = await fetchEventsPage()
+    expect(page.items[0]?.cost).toEqual({
+      amount: 0.001956,
+      currency: "USD",
+      source: "models.dev",
+      total_cost_nanos: 1_956_000,
+    })
+  })
+
+  test("uses cached Kimi pricing in USD for Kimi and DashScope", () => {
+    installModelsDevCatalog({
+      ...modelsDevProviderCatalogFixture,
+      "kimi-code-plan-cn": {
+        models: Object.fromEntries(
+          ["k3", "k3-256k"].map((id) => [
+            id,
+            { id, cost: { input: 3, output: 15, cache_read: 0.3 } },
+          ]),
+        ),
+      },
+    })
     const expectedCosts = [
       {
         currency: "USD",
@@ -498,10 +747,10 @@ describe("token usage storage", () => {
         totalCostNanos: 48_600_000,
       },
       {
-        currency: "CNY",
-        model: "kimi/kimi-k3",
+        currency: "USD",
+        model: "kimi-k3",
         providerName: "dashscope",
-        totalCostNanos: 324_000_000,
+        totalCostNanos: 48_600_000,
       },
     ]
 
@@ -517,10 +766,13 @@ describe("token usage storage", () => {
         }),
       ).toEqual({
         currency: expected.currency,
-        source: "builtin",
+        source: "models.dev",
         total_cost_nanos: expected.totalCostNanos,
       })
     }
+    expect(
+      resolveTokenUsageCost(buildPricedUsage("kimi/kimi-k3", "dashscope")),
+    ).toBeNull()
   })
 
   test("only falls back to interaction id when no real session id exists", async () => {
@@ -547,6 +799,166 @@ describe("token usage storage", () => {
     expect(page.items).toHaveLength(2)
     expect(page.items[0]?.session_id).toBe("real-session")
     expect(page.items[1]?.session_id).toBe("interaction-session")
+  })
+
+  test("supports calendar-to-date and lifetime periods", async () => {
+    const outside = localDate(2026, 3, 30, 23)
+    const monthStart = localDate(2026, 4, 1, 0)
+    const weekEvent = localDate(2026, 4, 12)
+    const now = localDate(2026, 4, 15, 15, 30)
+
+    setSystemTime(outside)
+    recordTokenUsageEvent({
+      endpoint: "responses",
+      input_tokens: 1,
+      model: "outside",
+      source: "copilot",
+    })
+    setSystemTime(monthStart)
+    recordTokenUsageEvent({
+      endpoint: "responses",
+      input_tokens: 2,
+      model: "month-start",
+      source: "copilot",
+    })
+    setSystemTime(weekEvent)
+    recordTokenUsageEvent({
+      endpoint: "responses",
+      input_tokens: 4,
+      model: "week-event",
+      source: "copilot",
+    })
+    setSystemTime(now)
+    recordTokenUsageEvent({
+      endpoint: "responses",
+      input_tokens: 8,
+      model: "now",
+      source: "copilot",
+    })
+    setSystemTime(localDate(2026, 4, 15, 18))
+    recordTokenUsageEvent({
+      endpoint: "responses",
+      input_tokens: 16,
+      model: "future",
+      source: "copilot",
+    })
+    setSystemTime(now)
+
+    const app = createTokenUsageApp()
+    const summary = async (period: string) => {
+      const response = await app.request(`/token-usage?period=${period}`)
+      expect(response.status).toBe(200)
+      return (await response.json()) as TokenUsageSummary
+    }
+    const week = await summary("this_week")
+    expect(week.range.start_ms).toBe(localDate(2026, 4, 11, 0).getTime())
+    expect(week.range.end_ms).toBe(now.getTime() + 1)
+    expect(week.totals.input_tokens).toBe(12)
+    const month = await summary("this_month")
+    expect(month.range.start_ms).toBe(monthStart.getTime())
+    expect(month.range.end_ms).toBe(now.getTime() + 1)
+    expect(month.totals.input_tokens).toBe(14)
+    const lifetime = await summary("lifetime")
+    expect(lifetime.range.start_ms).toBe(outside.getTime())
+    expect(lifetime.range.end_ms).toBe(now.getTime() + 1)
+    expect(lifetime.totals.input_tokens).toBe(15)
+
+    const dailyResponse = await app.request(
+      "/token-usage/daily?period=this_week",
+    )
+    const daily = (await dailyResponse.json()) as TokenUsageDailySummary
+    expect(daily.days).toHaveLength(5)
+    expect(daily.days[1]?.totals.input_tokens).toBe(4)
+    expect(daily.days[4]?.totals.input_tokens).toBe(8)
+
+    const monthDailyResponse = await app.request(
+      "/token-usage/daily?period=this_month",
+    )
+    const monthDaily =
+      (await monthDailyResponse.json()) as TokenUsageDailySummary
+    expect(monthDaily.days).toHaveLength(15)
+    expect(monthDaily.days[0]?.totals.input_tokens).toBe(2)
+
+    const eventsResponse = await app.request(
+      "/token-usage/events?period=lifetime",
+    )
+    const events = (await eventsResponse.json()) as TokenUsageEventsPage
+    expect(events.total).toBe(4)
+  })
+
+  test("buckets daily usage by runtime local days when SQLite uses another timezone", async () => {
+    // Changing TZ at runtime moves the JavaScript timezone but not SQLite's
+    // 'localtime', reproducing hosts where the two disagree.
+    const originalTz = process.env.TZ
+    const originalZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    process.env.TZ = "Pacific/Kiritimati"
+    try {
+      setSystemTime(localDate(2026, 4, 1, 0))
+      recordTokenUsageEvent({
+        endpoint: "responses",
+        input_tokens: 3,
+        model: "day-start",
+        source: "copilot",
+      })
+      setSystemTime(localDate(2026, 4, 2))
+
+      const response = await createTokenUsageApp().request(
+        "/token-usage/daily?period=this_month",
+      )
+      const daily = (await response.json()) as TokenUsageDailySummary
+
+      expect(daily.days.map((day) => day.date)).toEqual([
+        "2026-05-01",
+        "2026-05-02",
+      ])
+      expect(daily.days[0]?.totals.input_tokens).toBe(3)
+      expect(daily.days[0]?.byModel.map((model) => model.model)).toEqual([
+        "day-start",
+      ])
+    } finally {
+      // Deleting TZ alone keeps the current zone, so restore it explicitly.
+      process.env.TZ = originalTz ?? originalZone
+      if (originalTz === undefined) Reflect.deleteProperty(process.env, "TZ")
+    }
+  })
+
+  test("returns an empty lifetime range when there are no events", async () => {
+    setSystemTime(localDate(2026, 4, 15))
+    const app = createTokenUsageApp()
+    const summaryResponse = await app.request("/token-usage?period=lifetime")
+    const dailyResponse = await app.request(
+      "/token-usage/daily?period=lifetime",
+    )
+    const summary = (await summaryResponse.json()) as TokenUsageSummary
+    const daily = (await dailyResponse.json()) as TokenUsageDailySummary
+
+    expect(summary.range.start_ms).toBe(summary.range.end_ms)
+    expect(summary.totals.request_count).toBe(0)
+    expect(daily.range.start_ms).toBe(daily.range.end_ms)
+    expect(daily.days).toEqual([])
+  })
+
+  test("maps legacy period names to the renamed periods", async () => {
+    const now = localDate(2026, 4, 15, 15, 30)
+    setSystemTime(now)
+    const app = createTokenUsageApp()
+    const legacyPeriods: Array<[string, TokenUsagePeriod]> = [
+      ["day", "today"],
+      ["week", "last_7_days"],
+      ["month", "last_30_days"],
+    ]
+
+    for (const [legacy, expected] of legacyPeriods) {
+      const response = await app.request(`/token-usage?period=${legacy}`)
+      expect(response.status).toBe(200)
+      const summary = (await response.json()) as TokenUsageSummary
+      expect(summary.period).toBe(expected)
+      expect(summary.range.end_ms).toBe(now.getTime() + 1)
+    }
+
+    const weekResponse = await app.request("/token-usage?period=week")
+    const weekSummary = (await weekResponse.json()) as TokenUsageSummary
+    expect(weekSummary.range.start_ms).toBe(localDate(2026, 4, 9, 0).getTime())
   })
 
   test("returns daily token usage buckets by model with total tokens", async () => {
@@ -593,12 +1005,12 @@ describe("token usage storage", () => {
 
     setSystemTime(localDate(2026, 4, 15))
     const response = await createTokenUsageApp().request(
-      "/token-usage/daily?period=week",
+      "/token-usage/daily?period=last_7_days",
     )
     expect(response.status).toBe(200)
 
     const daily = (await response.json()) as TokenUsageDailySummary
-    expect(daily.period).toBe("week")
+    expect(daily.period).toBe("last_7_days")
     expect(daily.days).toHaveLength(7)
     expect(daily.totals).toEqual({
       cache_creation_input_tokens: 1,
@@ -659,7 +1071,7 @@ describe("token usage storage", () => {
     expect(may14?.byModel[0]?.total_tokens).toBe(100)
   })
 
-  test("returns empty daily buckets and falls back invalid period to day", async () => {
+  test("returns empty daily buckets and falls back invalid period to today", async () => {
     setSystemTime(localDate(2026, 4, 15))
     const response = await createTokenUsageApp().request(
       "/token-usage/daily?period=invalid",
@@ -667,11 +1079,57 @@ describe("token usage storage", () => {
     expect(response.status).toBe(200)
 
     const daily = (await response.json()) as TokenUsageDailySummary
-    expect(daily.period).toBe("day")
+    expect(daily.period).toBe("today")
     expect(daily.days).toHaveLength(1)
     expect(daily.days[0]?.date).toBe(localDateLabel(localDate(2026, 4, 15)))
     expect(daily.days[0]?.totals.total_tokens).toBe(0)
     expect(daily.byModel).toEqual([])
     expect(daily.totals.request_count).toBe(0)
+  })
+})
+
+describe("token usage sessions page", () => {
+  test("aggregates per session and paginates on the server", async () => {
+    for (const [sessionId, tokens] of [
+      ["session-a", 10],
+      ["session-a", 20],
+      ["session-b", 5],
+      ["session-c", 50],
+    ] as const) {
+      recordTokenUsageEvent({
+        endpoint: "messages",
+        input_tokens: tokens,
+        model: "gpt-test",
+        output_tokens: 0,
+        sessionId,
+        source: "copilot",
+      })
+    }
+
+    const fetchPage = async (page: number) => {
+      const response = await createTokenUsageApp().request(
+        `/token-usage/sessions?period=today&page=${page}&page_size=2`,
+      )
+      expect(response.status).toBe(200)
+      return (await response.json()) as TokenUsageSessionsPage
+    }
+
+    const first = await fetchPage(1)
+    expect(first.total).toBe(3)
+    expect(first.total_pages).toBe(2)
+    expect(
+      first.items.map((row) => [
+        row.session_id,
+        row.request_count,
+        row.total_tokens,
+      ]),
+    ).toEqual([
+      ["session-c", 1, 50],
+      ["session-a", 2, 30],
+    ])
+
+    const second = await fetchPage(2)
+    expect(second.items.map((row) => row.session_id)).toEqual(["session-b"])
+    expect((await fetchPage(3)).items).toEqual([])
   })
 })

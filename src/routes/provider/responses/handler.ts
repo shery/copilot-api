@@ -6,12 +6,14 @@ import { logCodexRateLimitsEvent } from "~/lib/codex-rate-limit"
 import {
   type ModelConfig,
   type ProviderType,
-  resolveEffectiveProviderType,
+  resolveProviderConfigForModel,
 } from "~/lib/config"
 import { HTTPError } from "~/lib/error"
+import { recordResponsesFirstToken } from "~/lib/first-token"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
 import { requestContext } from "~/lib/request-context"
+import { writeSSEIfConnected } from "~/lib/sse"
 import {
   createProviderTokenUsageRecorder,
   normalizeResponsesUsage,
@@ -25,7 +27,11 @@ import {
   filterReasoningForTransport,
 } from "~/routes/responses/utils"
 import { handleResponsesViaMessages } from "~/routes/responses/messages-handler"
-import { normalizeProviderResponsesReasoningEffort } from "~/routes/provider/utils"
+import { getCodexTaskTitleModel } from "~/routes/responses/task-title"
+import {
+  forwardProviderResponseHeaders,
+  normalizeProviderResponsesReasoningEffort,
+} from "~/routes/provider/utils"
 
 import type {
   ResponsesPayload,
@@ -58,14 +64,24 @@ export async function handleProviderResponsesForProvider(
   },
 ): Promise<Response> {
   const { payload, provider } = options
+  const taskTitleModel = getCodexTaskTitleModel(
+    c.req.header("user-agent"),
+    payload.input,
+    provider,
+  )
+  if (taskTitleModel) payload.model = taskTitleModel
+  const publicModel = taskTitleModel ?? options.publicModel ?? payload.model
 
   debugJson(logger, "Responses request payload:", {
     payload,
     provider,
   })
 
-  const providerConfig =
+  const configuredProvider =
     await providerResponsesHandlerDependencies.resolveProviderConfig(provider)
+  const providerConfig =
+    configuredProvider
+    && resolveProviderConfigForModel(configuredProvider, payload.model)
   if (!providerConfig) {
     return c.json(
       {
@@ -78,10 +94,7 @@ export async function handleProviderResponsesForProvider(
     )
   }
 
-  const effectiveType = resolveEffectiveProviderType(
-    providerConfig,
-    payload.model,
-  )
+  const effectiveType = providerConfig.type
   const normalizedReasoningEffort = normalizeProviderResponsesReasoningEffort(
     payload,
     providerConfig,
@@ -96,7 +109,7 @@ export async function handleProviderResponsesForProvider(
     filterReasoningForTransport(payload, true)
     return await handleResponsesViaMessages(c, {
       payload,
-      publicModel: options.publicModel ?? payload.model,
+      publicModel,
       targetModel: `${provider}/${payload.model}`,
     })
   }
@@ -145,7 +158,11 @@ export async function handleProviderResponsesForProvider(
       payload,
       c.req.raw.headers,
       providerConfig.baseUrl,
-      { signal: c.req.raw.signal },
+      {
+        clientSignal: c.req.raw.signal,
+        onResponseHeaders: (headers) =>
+          forwardProviderResponseHeaders(c, headers),
+      },
     )
     const recordUsage = createProviderResponsesUsageRecorder(
       payload,
@@ -171,7 +188,7 @@ export async function handleProviderResponsesForProvider(
     providerConfig,
     payload,
     c.req.raw.headers,
-    { signal: c.req.raw.signal },
+    { clientSignal: c.req.raw.signal },
   )
 
   if (!upstreamResponse.ok) {
@@ -189,15 +206,11 @@ export async function handleProviderResponsesForProvider(
   )
 
   if (payload.stream) {
-    return streamProviderResponses(
-      c,
-      getResponsesEvents(upstreamResponse, c.req.raw.signal),
-      {
-        normalizeCodex: false,
-        provider,
-        recordUsage,
-      },
-    )
+    return streamProviderResponses(c, getResponsesEvents(upstreamResponse), {
+      normalizeCodex: false,
+      provider,
+      recordUsage,
+    })
   }
 
   const responseBody = (await upstreamResponse
@@ -213,7 +226,11 @@ const shouldFallbackToMessages = (
   modelId: string,
   effectiveType: ProviderType,
 ): boolean => {
-  if (effectiveType === "anthropic" || effectiveType === "openai-compatible") {
+  if (
+    effectiveType === "anthropic"
+    || effectiveType === "openai-compatible"
+    || effectiveType === "google"
+  ) {
     return true
   }
 
@@ -239,6 +256,7 @@ const createProviderResponsesUsageRecorder = (
     pricing: modelConfig?.pricing,
     pricingCurrency,
     providerName: provider,
+    serviceTier: payload.service_tier,
     sessionId: sessionAffinity ?? "",
   })
 }
@@ -298,15 +316,14 @@ const streamProviderResponses = async (
           normalizeCodex: options.normalizeCodex,
           provider: options.provider,
         })
-        if (event && options.normalizeCodex) {
-          responseChunk = {
-            ...chunk,
-            data: JSON.stringify(event),
-            event: event.type,
-          }
+        if (event && options.normalizeCodex && chunk.event !== event.type) {
+          // The Codex normalizer observes rate limits but does not modify
+          // the event body. Keep the original JSON instead of re-encoding it.
+          responseChunk = { ...chunk, event: event.type }
         }
       }
 
+      recordResponsesFirstToken(event)
       if (event) {
         const nextUsage = getResponsesStreamEventUsage(event)
         if (nextUsage) {
@@ -314,7 +331,7 @@ const streamProviderResponses = async (
         }
       }
 
-      await stream.writeSSE({
+      await writeSSEIfConnected(stream, {
         data: responseChunk.data ?? "",
         event: responseChunk.event,
       })
@@ -372,10 +389,5 @@ const getResponsesStreamEventUsage = (
   return null
 }
 
-const getResponsesEvents = (
-  response: Response,
-  signal?: AbortSignal,
-): ResponsesStream =>
-  createResponsesSafeStream(createResponsesHttpEventStream(response, signal), {
-    signal,
-  })
+const getResponsesEvents = (response: Response): ResponsesStream =>
+  createResponsesSafeStream(createResponsesHttpEventStream(response))

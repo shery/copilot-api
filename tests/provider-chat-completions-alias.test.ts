@@ -1,7 +1,18 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
+import { installModelsDevCatalog } from "~/lib/models-dev-cache"
+
+import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
 
 const actualConfigModule = await import("~/lib/config")
 const actualTokenUsageModule = await import("~/lib/token-usage")
@@ -10,16 +21,12 @@ let providerConfig: ResolvedProviderConfig | null = null
 let modelMappings: Record<string, string> = {}
 
 const noopTokenUsageRecorder = () => {}
+let restoreTokenUsageRecorder = () => {}
 
 await mock.module("~/lib/config", () => ({
   ...actualConfigModule,
   getProviderConfig: () => providerConfig,
   resolveMappedModel: (model: string) => modelMappings[model] ?? model,
-}))
-
-await mock.module("~/lib/token-usage", () => ({
-  ...actualTokenUsageModule,
-  createProviderTokenUsageRecorder: () => noopTokenUsageRecorder,
 }))
 
 const { completionRoutes } = await import("~/routes/chat-completions/route")
@@ -67,6 +74,11 @@ const createApp = () => {
 }
 
 beforeEach(() => {
+  const recorder = spyOn(
+    actualTokenUsageModule,
+    "createProviderTokenUsageRecorder",
+  ).mockImplementation(() => noopTokenUsageRecorder)
+  restoreTokenUsageRecorder = () => recorder.mockRestore()
   providerConfig = {
     apiKey: "provider-key",
     authType: "authorization",
@@ -93,11 +105,50 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  restoreTokenUsageRecorder()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   providerConfig = null
 })
 
 describe("provider/model aliases on top-level chat completions route", () => {
+  test("forwards a selected models.dev model to its own API URL", async () => {
+    installModelsDevCatalog({
+      ...modelsDevCatalogFixture,
+      example: {
+        npm: "@ai-sdk/openai-compatible",
+        api: "https://api.example.com/v1",
+        models: {
+          "qwen-plus": {
+            id: "qwen-plus",
+            provider: {
+              api: "https://model.example.com/api/v4",
+              npm: "@ai-sdk/openai-compatible",
+            },
+          },
+        },
+      },
+    })
+    providerConfig = {
+      ...providerConfig!,
+      baseUrl: "https://api.example.com/v1",
+      modelsDevProviderId: "example",
+    }
+
+    const response = await createApp().request("/v1/chat/completions", {
+      body: JSON.stringify({
+        messages: [{ content: "hello", role: "user" }],
+        model: "dash/qwen-plus",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://model.example.com/api/v4/chat/completions",
+    )
+  })
+
   test("routes mapped models to provider chat completions before rate limiting", async () => {
     modelMappings = {
       "gpt-provider": "dash/qwen-plus",
