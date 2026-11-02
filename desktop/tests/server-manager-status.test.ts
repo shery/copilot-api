@@ -13,6 +13,7 @@ function runManagerScenario(scenario: string): void {
       import childProcess from 'node:child_process'
       import { EventEmitter } from 'node:events'
       import path from 'node:path'
+      import { PassThrough } from 'node:stream'
       let stopExitCode = 0
       let forkError
       let startupExitCode
@@ -20,12 +21,14 @@ function runManagerScenario(scenario: string): void {
       let spawnError
       let spawnOptions
       let forkOptions
+      let captureLogStreams = false
       const electronApp = { isPackaged: false, getAppPath: () => process.cwd() }
       const processes = []
       const createProcess = () => {
         const proc = new EventEmitter()
         Object.assign(proc, {
-          stdout: null, stderr: null,
+          stdout: captureLogStreams ? new PassThrough() : null,
+          stderr: captureLogStreams ? new PassThrough() : null,
           kill() { queueMicrotask(() => proc.emit('exit', stopExitCode)); return true },
         })
         processes.push(proc)
@@ -205,7 +208,7 @@ test('starts the packaged JavaScript directly with supported Bun and preserves p
     assert.equal(spawnOptions[2].env.COPILOT_API_GITHUB_TOKEN, undefined)
     assert.equal(spawnOptions[2].windowsHide, true)
     assert.deepEqual(spawnOptions[2].stdio, ['ignore', 'pipe', 'pipe'])
-    assert.ok(manager.getLogs().some((line) => line.includes('Bun 1.4.0')))
+    assert.ok(manager.getLogs().some((entry) => entry.text.includes('Bun 1.4.0')))
   `)
 })
 
@@ -215,12 +218,58 @@ test('uses bundled Node when Bun is unavailable or explicitly disabled', () => {
     await manager.startServer(0)
     assert.equal(spawnOptions, undefined)
     assert.equal(forkOptions[2].env.NODE_USE_SYSTEM_CA, '1')
-    assert.ok(manager.getLogs().some((line) => line.includes('server.bunFallback')))
+    assert.ok(manager.getLogs().some((entry) => entry.text.includes('server.bunFallback')))
     bunRuntime = { available: true, version: '1.4.0', path: '/local/bun' }
     await manager.startServer(0, { runtime: 'node' })
     assert.equal(spawnOptions, undefined)
     assert.equal(forkOptions[2].env.NODE_USE_SYSTEM_CA, '1')
-    assert.ok(!manager.getLogs().some((line) => line.includes('server.bunFallback')))
+    assert.ok(!manager.getLogs().some((entry) => entry.text.includes('server.bunFallback')))
+  `)
+})
+
+test('keeps log sequence numbers monotonic across server restarts', () => {
+  runManagerScenario(`
+    await manager.startServer(0)
+    const previousLast = manager.getLogs().at(-1).sequence
+    await manager.startServer(0)
+    const logs = manager.getLogs()
+    assert.ok(logs.length > 0)
+    assert.ok(logs[0].sequence > previousLast)
+    assert.equal(new Set(logs.map((entry) => entry.sequence)).size, logs.length)
+  `)
+})
+
+test('keeps the newest 2000 console lines without truncating a long line', () => {
+  runManagerScenario(`
+    captureLogStreams = true
+    await manager.startServer(0)
+    const proc = processes.at(-1)
+    const longLine = 'H'.repeat(40000)
+    proc.stdout.write(longLine)
+    assert.equal(manager.getLogs().at(-1).text, longLine)
+    for (let i = 0; i < 2000; i++) proc.stdout.write('line ' + i + '\\n')
+    const logs = manager.getLogs()
+    assert.equal(logs.length, 2000)
+    assert.equal(logs[0].text, 'line 0\\n')
+    assert.equal(logs.at(-1).text, 'line 1999\\n')
+    assert.ok(logs.at(-1).sequence > logs[0].sequence)
+    assert.ok(!logs.some((entry) => entry.text === longLine))
+    assert.ok(!logs.some((entry) => entry.text.includes('server.bunFallback')))
+    const copy = manager.getLogs()
+    copy.push({ sequence: 1, text: 'mutated' })
+    assert.equal(manager.getLogs().some((entry) => entry.text === 'mutated'), false)
+  `)
+})
+
+test('clearing stored logs drops history and keeps later sequences', () => {
+  runManagerScenario(`
+    await manager.startServer(0)
+    const watermark = manager.clearLogs()
+    assert.equal(manager.getLogs().length, 0)
+    await manager.startServer(0)
+    const logs = manager.getLogs()
+    assert.ok(logs.length > 0)
+    assert.ok(logs.every((entry) => entry.sequence > watermark))
   `)
 })
 
@@ -237,7 +286,7 @@ test('keeps migrated system proxy settings on bundled Node when Bun is available
     assert.equal(spawnOptions, undefined)
     assert.ok(forkOptions)
     assert.ok(!forkOptions[1].includes('--proxy-env'))
-    assert.ok(manager.getLogs().some((line) => line.includes('Node.js (Electron)')))
+    assert.ok(manager.getLogs().some((entry) => entry.text.includes('Node.js (Electron)')))
   `)
 })
 
